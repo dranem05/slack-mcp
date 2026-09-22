@@ -62,9 +62,9 @@ describe("validateUserId", () => {
   });
 
   it("rejects an @handle with a friendly hint to look the user up", () => {
-    expect(() => validateUserId("@david")).toThrow(ValidationError);
+    expect(() => validateUserId("@erin")).toThrow(ValidationError);
     try {
-      validateUserId("@david");
+      validateUserId("@erin");
       throw new Error("expected throw");
     } catch (err) {
       expect((err as Error).message).toMatch(/slack_users_search/);

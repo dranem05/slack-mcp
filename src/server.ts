@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SlackAuth } from "./auth.js";
 import { ServiceContext } from "./types.js";
-import { createIdentityLookup } from "./utils/identity.js";
+import { createIdentityLookup, createTimezoneLookup } from "./utils/identity.js";
 import { registerConversationsTools } from "./services/conversations/index.js";
 import { registerChannelsTools } from "./services/channels/index.js";
 import { registerUsersTools } from "./services/users/index.js";
@@ -23,9 +23,11 @@ export function createServer(auth: SlackAuth): McpServer {
     version: "0.1.0",
   });
 
+  const getMyUserId = createIdentityLookup(auth.client);
   const ctx: ServiceContext = {
     ...auth,
-    getMyUserId: createIdentityLookup(auth.client),
+    getMyUserId,
+    getMyTimezone: createTimezoneLookup(auth.client, getMyUserId),
   };
 
   registerConversationsTools(server, ctx);

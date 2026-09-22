@@ -6,6 +6,7 @@ import { withErrorHandling } from "../../utils/errors.js";
 import { validateChannelId, validateTs, clampLimit } from "../../utils/validate.js";
 import { pruneMessages } from "../../utils/pruning.js";
 import { mapWithConcurrencySettled } from "../../utils/concurrency.js";
+import { computeSearchWindow, trimToWindow } from "../../utils/searchWindow.js";
 import {
   BLOCKS_DESCRIPTION,
   resolveMessageContent,
@@ -314,7 +315,7 @@ export function registerConversationsTools(
 
   server.tool(
     "slack_my_mentions",
-    "Find recent messages that mention the authenticated user (works across channel top-level posts and thread replies, regardless of read state). Use this to catch @mentions that slack_conversations_unreads misses — that tool only returns channels with top-level unreads, so it skips thread mentions and mentions in already-read channels.",
+    "Find recent messages that mention the authenticated user (works across channel top-level posts and thread replies, regardless of read state). Use this to catch @mentions that slack_conversations_unreads misses — that tool only returns channels with top-level unreads, so it skips thread mentions and mentions in already-read channels. The returned 'window' object reports the exact range searched: 'floor_iso' is the true cutoff, 'tz' and 'tz_source' the timezone it was derived in (anything but tz_source 'slack' is a degraded fallback and is explained in 'tz_error'), 'slack_after' the widened date actually sent to Slack, and 'trimmed_out' how many over-fetched older matches were removed. Note 'total' counts the widened query, so it can exceed the number of matches returned.",
     {
       hours: z
         .number()
@@ -334,14 +335,19 @@ export function registerConversationsTools(
         ),
     },
     withErrorHandling(ctx.slug, async ({ hours, count, page }) => {
-      // search.messages documents count as 1-100.
+      // search.messages documents count as 1-100. Going over doesn't raise —
+      // Slack silently falls back to 20 per page, so a "be thorough" bump
+      // would quietly REDUCE coverage. clampLimit keeps it in range.
       const clampedCount = clampLimit(count, { max: 100, field: "count" });
       const userId = await ctx.getMyUserId();
 
-      // Slack search 'after:' takes YYYY-MM-DD. Compute the date floor from `hours` ago.
-      const floorMs = Date.now() - hours * 3600 * 1000;
-      const after = new Date(floorMs).toISOString().slice(0, 10);
-      const query = `<@${userId}> after:${after}`;
+      // Slack search 'after:' takes YYYY-MM-DD, is exclusive of the day it
+      // names, and is evaluated in the user's timezone — so the date is
+      // derived in that timezone and widened by a day, then the over-fetch
+      // is trimmed back to the exact window below. See utils/searchWindow.ts.
+      const tz = await ctx.getMyTimezone();
+      const window = computeSearchWindow(hours, tz.tz);
+      const query = `<@${userId}> after:${window.slackAfter}`;
 
       const res = await api().search.messages({
         query,
@@ -351,11 +357,32 @@ export function registerConversationsTools(
         page,
       });
 
+      // sort_dir desc means the widening's extra messages are the oldest and
+      // therefore the tail of the result set: trimming a page can only cut
+      // its end, never hide a match a later page would have carried. Callers
+      // page with the returned `paging` exactly as before.
+      const { kept, trimmedOut, unparsableTs } = trimToWindow(
+        res.messages?.matches ?? [],
+        window.floorSeconds
+      );
+
       return textResult({
         user_id: userId,
         query,
+        window: {
+          hours,
+          floor_iso: window.floorIso,
+          tz: window.tz,
+          tz_source: tz.source,
+          ...(tz.error ? { tz_error: tz.error } : {}),
+          slack_after: window.slackAfter,
+          trimmed_out: trimmedOut,
+          // Kept rather than dropped — a match whose ts can't be read is
+          // unknown, not out of window.
+          ...(unparsableTs > 0 ? { kept_unparsable_ts: unparsableTs } : {}),
+        },
         total: res.messages?.total,
-        matches: res.messages?.matches,
+        matches: kept,
         paging: res.messages?.paging,
       });
     })
