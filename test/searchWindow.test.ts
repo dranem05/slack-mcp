@@ -140,6 +140,96 @@ describe("computeSearchWindow", () => {
     it.each([0, -5, NaN, Infinity])("throws ValidationError for hours=%s", (hours) => {
       expect(() => computeSearchWindow(hours, ET)).toThrow(ValidationError);
     });
+
+    it("throws ValidationError, not a bare RangeError, when hours pushes the floor out of range", () => {
+      // new Date(floorMs).toISOString() would throw "Invalid time value" here.
+      expect(() => computeSearchWindow(1e13, ET)).toThrow(ValidationError);
+      expect(() => computeSearchWindow(Number.MAX_SAFE_INTEGER, ET)).toThrow(ValidationError);
+    });
+
+    it("throws rather than emitting a pre-1970 or negative year Slack cannot parse", () => {
+      // 1e9 hours back lands ~112000 BCE; Intl renders the year without an
+      // era, so the date would silently come back positive and 6 digits wide.
+      expect(() => computeSearchWindow(1e9, ET)).toThrow(ValidationError);
+    });
+  });
+});
+
+describe("an approximate (fallback) timezone widens the window further", () => {
+  const now = at("2026-09-23T03:00:00Z");
+
+  it("widens by one day when the timezone came from Slack", () => {
+    const w = computeSearchWindow(24, "America/Los_Angeles", now);
+    expect(w.daysWidened).toBe(1);
+  });
+
+  it("widens by three days when the timezone is only a guess", () => {
+    const w = computeSearchWindow(24, "America/Los_Angeles", now, true);
+    expect(w.daysWidened).toBe(3);
+    // Floor is 9/21 20:00 PDT, so the local date is the 21st.
+    expect(w.slackAfter).toBe("2026-09-18");
+  });
+
+  it("covers the floor even when the guessed zone is a full day ahead of the real one", () => {
+    // Real user in PT, lookup failed, host is UTC. Floor = 2026-09-22T03:00Z
+    // == 9/21 20:00 PT. Deriving in UTC yields the 22nd, a day ahead of the
+    // real local date, so a one-day widening starts Slack's coverage at
+    // 9/22 00:00 PT — four hours INSIDE the requested window.
+    const wrong = computeSearchWindow(24, "UTC", now, false);
+    expect(wrong.slackAfter).toBe("2026-09-21"); // covers from 9/22 PT — too late
+
+    const widened = computeSearchWindow(24, "UTC", now, true);
+    expect(widened.slackAfter).toBe("2026-09-19"); // covers from 9/20 PT — before the floor
+  });
+
+  it("does not move the floor itself — only the query is widened", () => {
+    const exact = computeSearchWindow(24, "UTC", now, false);
+    const widened = computeSearchWindow(24, "UTC", now, true);
+    expect(widened.floorMs).toBe(exact.floorMs);
+    expect(widened.floorSeconds).toBe(exact.floorSeconds);
+  });
+});
+
+describe("zones the naive implementation would get wrong", () => {
+  it("handles a half-hour offset zone", () => {
+    // Floor 2026-09-15 05:15 IST == 2026-09-14T23:45Z: UTC says the 14th.
+    const w = computeSearchWindow(1, "Asia/Kolkata", at("2026-09-15T00:45:00Z"));
+    expect(buggyAfter(w.floorMs)).toBe("2026-09-14");
+    expect(w.slackAfter).toBe("2026-09-14");
+  });
+
+  it("handles a 45-minute offset zone", () => {
+    // Floor 2026-09-15 00:30 NPT == 2026-09-14T18:45Z.
+    const w = computeSearchWindow(1, "Asia/Kathmandu", at("2026-09-14T19:45:00Z"));
+    expect(buggyAfter(w.floorMs)).toBe("2026-09-14");
+    expect(w.slackAfter).toBe("2026-09-14");
+  });
+
+  it("handles southern-hemisphere DST", () => {
+    // 2026-10-04 is Sydney's spring-forward. Floor 2026-10-04 09:00 AEDT.
+    const w = computeSearchWindow(1, "Australia/Sydney", at("2026-10-03T23:00:00Z"));
+    expect(w.slackAfter).toBe("2026-10-03");
+  });
+
+  it("handles a zone whose local midnight does not exist on the floor's date", () => {
+    // Sao Paulo 2018-11-04 jumped 00:00 -> 01:00. The date still resolves.
+    const w = computeSearchWindow(1, "America/Sao_Paulo", at("2018-11-04T05:00:00Z"));
+    expect(w.slackAfter).toBe("2018-11-03");
+  });
+
+  it("handles a fall-back day with a repeated local hour", () => {
+    // 2026-11-01 01:30 ET occurs twice; both resolve to the same local date.
+    const first = computeSearchWindow(1, ET, at("2026-11-01T06:30:00Z"));
+    const second = computeSearchWindow(1, ET, at("2026-11-01T07:30:00Z"));
+    expect(first.slackAfter).toBe("2026-10-31");
+    expect(second.slackAfter).toBe("2026-10-31");
+  });
+
+  it("handles the UTC+14 extreme", () => {
+    // Floor 2026-09-23 00:00 in Kiritimati == 2026-09-22T10:00Z.
+    const w = computeSearchWindow(1, "Pacific/Kiritimati", at("2026-09-22T11:00:00Z"));
+    expect(buggyAfter(w.floorMs)).toBe("2026-09-22");
+    expect(w.slackAfter).toBe("2026-09-22");
   });
 });
 

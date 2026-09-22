@@ -38,8 +38,14 @@ export interface SearchWindow {
   floorIso: string;
   /** IANA timezone the calendar date was derived in. */
   tz: string;
-  /** Value to send as `after:` — the day BEFORE the floor's local date. */
+  /** Value to send as `after:` — `daysWidened` days before the floor's local date. */
   slackAfter: string;
+  /**
+   * How many days the query was widened by. 1 when the timezone came from
+   * Slack; more when it is a fallback guess, since a wrong zone can shift
+   * the derived date and the widening is the only thing absorbing that.
+   */
+  daysWidened: number;
 }
 
 export interface TrimResult<T> {
@@ -54,6 +60,20 @@ export interface TrimResult<T> {
    */
   unparsableTs: number;
 }
+
+// `after:` is exclusive, so one day back is exactly enough when the timezone
+// is known. When it is a fallback guess the derived calendar date can be off
+// by up to two days (the extremes are ~26h apart: UTC+14 vs UTC-11), so three
+// days back is what guarantees coverage. The client-side trim removes the
+// over-fetch either way, so widening costs bytes, never precision.
+const DAYS_BACK_TZ_KNOWN = 1;
+const DAYS_BACK_TZ_GUESSED = 3;
+
+// Slack did not exist before 1970, and `Date` cannot render an instant outside
+// +/-8.64e15 ms at all — an `hours` big enough to leave that range is a caller
+// bug, and must surface as one rather than as a RangeError from toISOString().
+const MIN_FLOOR_MS = 0;
+const MAX_FLOOR_MS = 8.64e15;
 
 // Intl.DateTimeFormat construction is comparatively expensive and the same
 // one or two zones are used for the life of the process.
@@ -80,7 +100,8 @@ export function isValidTimeZone(tz: string | undefined | null): boolean {
 export function computeSearchWindow(
   hours: number,
   tz: string,
-  now: () => number = Date.now
+  now: () => number = Date.now,
+  tzIsApproximate = false
 ): SearchWindow {
   if (!Number.isFinite(hours) || hours <= 0) {
     throw new ValidationError(
@@ -94,16 +115,25 @@ export function computeSearchWindow(
   }
 
   const floorMs = now() - hours * 3600 * 1000;
+  if (floorMs < MIN_FLOOR_MS || floorMs > MAX_FLOOR_MS) {
+    throw new ValidationError(
+      `hours=${hours} puts the search floor outside the representable range ` +
+        `(it resolves to before 1970 or beyond year 275760). Use a smaller lookback.`
+    );
+  }
+
+  const daysWidened = tzIsApproximate ? DAYS_BACK_TZ_GUESSED : DAYS_BACK_TZ_KNOWN;
 
   return {
     floorMs,
     floorSeconds: floorMs / 1000,
     floorIso: new Date(floorMs).toISOString(),
     tz,
-    // One day earlier than the floor's LOCAL date: `after:` excludes the day
-    // it names, so naming the floor's own date would drop every message
-    // between the floor and local midnight at the end of that day.
-    slackAfter: previousCalendarDay(localCalendarDate(floorMs, tz)),
+    // Earlier than the floor's LOCAL date: `after:` excludes the day it
+    // names, so naming the floor's own date would drop every message between
+    // the floor and local midnight at the end of that day.
+    slackAfter: shiftCalendarDays(localCalendarDate(floorMs, tz), -daysWidened),
+    daysWidened,
   };
 }
 
@@ -117,6 +147,12 @@ export function computeSearchWindow(
  * a later page would have carried — so a caller walking `paging` still sees
  * every in-window result, and a page that trims to empty means the floor
  * has been crossed.
+ *
+ * That rests on Slack sorting each match by its OWN ts rather than its
+ * thread parent's, which matters because most matches are thread replies.
+ * Measured against a live workspace: 120 matches, 92 of them replies, order
+ * strictly non-increasing in own ts, including 64 replies whose root was
+ * 4-7 days older than the match sorted immediately below them.
  */
 export function trimToWindow<T extends { ts?: string }>(
   matches: T[],
@@ -184,14 +220,14 @@ function localCalendarDate(ms: number, tz: string): CalendarDate {
 // Calendar arithmetic only — done in UTC space so it is immune to DST
 // transitions in the source zone (a local day can be 23 or 25 hours long,
 // but "the previous calendar date" is unaffected by that).
-function previousCalendarDay({ year, month, day }: CalendarDate): string {
+function shiftCalendarDays({ year, month, day }: CalendarDate, days: number): string {
   const d = new Date(0);
   // setUTCFullYear (not Date.UTC) so years 0-99 aren't remapped to 1900-1999,
-  // and so the year is in place before the day subtraction — otherwise a
-  // Mar 1 floor would resolve Feb 28 vs Feb 29 against the wrong year.
+  // and so the year is in place before the day shift — otherwise a Mar 1
+  // floor would resolve Feb 28 vs Feb 29 against the wrong year.
   d.setUTCFullYear(year, month - 1, day);
   d.setUTCHours(0, 0, 0, 0);
-  d.setUTCDate(d.getUTCDate() - 1);
+  d.setUTCDate(d.getUTCDate() + days);
   return `${String(d.getUTCFullYear()).padStart(4, "0")}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
 

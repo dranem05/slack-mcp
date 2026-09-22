@@ -315,13 +315,18 @@ export function registerConversationsTools(
 
   server.tool(
     "slack_my_mentions",
-    "Find recent messages that mention the authenticated user (works across channel top-level posts and thread replies, regardless of read state). Use this to catch @mentions that slack_conversations_unreads misses — that tool only returns channels with top-level unreads, so it skips thread mentions and mentions in already-read channels. The returned 'window' object reports the exact range searched: 'floor_iso' is the true cutoff, 'tz' and 'tz_source' the timezone it was derived in (anything but tz_source 'slack' is a degraded fallback and is explained in 'tz_error'), 'slack_after' the widened date actually sent to Slack, and 'trimmed_out' how many over-fetched older matches were removed. Note 'total' counts the widened query, so it can exceed the number of matches returned.",
+    "Find recent messages that mention the authenticated user (works across channel top-level posts and thread replies, regardless of read state). Use this to catch @mentions that slack_conversations_unreads misses — that tool only returns channels with top-level unreads, so it skips thread mentions and mentions in already-read channels. The returned 'window' object reports the exact range searched: 'floor_iso' is the true cutoff, 'tz' and 'tz_source' the timezone it was derived in (anything but tz_source 'slack' is a degraded fallback and is explained in 'tz_error'), 'slack_after' the widened date actually sent to Slack, and 'trimmed_out' how many over-fetched older matches were removed. Note 'total' and 'paging' describe the WIDENED query, so they over-report: 'paging.pages' can include pages that lie entirely before the floor and come back empty. Stop paging when 'window.reached_floor' is true — that means the floor has been crossed and no later page holds an in-window match.",
     {
       hours: z
         .number()
         .optional()
         .default(24)
-        .describe("Look back this many hours (used to compute the search 'after:' date filter)"),
+        .describe(
+          "Look back this many hours. This is an exact floor, not just a date filter: the " +
+            "query is widened to whole days (Slack's 'after:' only takes YYYY-MM-DD) and the " +
+            "extra older messages are then dropped client-side, so a match from earlier the " +
+            "same local day is correctly absent. See the returned 'window'."
+        ),
       count: z
         .number()
         .optional()
@@ -345,8 +350,11 @@ export function registerConversationsTools(
       // names, and is evaluated in the user's timezone — so the date is
       // derived in that timezone and widened by a day, then the over-fetch
       // is trimmed back to the exact window below. See utils/searchWindow.ts.
+      // A fallback timezone is a guess, and a guessed zone can shift the
+      // derived calendar date — so the window widens further when the lookup
+      // didn't come from Slack. The client-side trim keeps it exact either way.
       const tz = await ctx.getMyTimezone();
-      const window = computeSearchWindow(hours, tz.tz);
+      const window = computeSearchWindow(hours, tz.tz, Date.now, tz.source !== "slack");
       const query = `<@${userId}> after:${window.slackAfter}`;
 
       const res = await api().search.messages({
@@ -361,8 +369,13 @@ export function registerConversationsTools(
       // therefore the tail of the result set: trimming a page can only cut
       // its end, never hide a match a later page would have carried. Callers
       // page with the returned `paging` exactly as before.
+      // An absent `messages`/`matches` is a malformed response, NOT "zero
+      // mentions" — reporting it as an empty list would make a failure
+      // indistinguishable from a clean result.
+      const rawMatches = res.messages?.matches;
+      const responseIsUsable = Array.isArray(rawMatches);
       const { kept, trimmedOut, unparsableTs } = trimToWindow(
-        res.messages?.matches ?? [],
+        responseIsUsable ? rawMatches : [],
         window.floorSeconds
       );
 
@@ -376,13 +389,23 @@ export function registerConversationsTools(
           tz_source: tz.source,
           ...(tz.error ? { tz_error: tz.error } : {}),
           slack_after: window.slackAfter,
+          days_widened: window.daysWidened,
           trimmed_out: trimmedOut,
+          // Declared stop signal for pagination: matches older than the floor
+          // appeared, so under the timestamp-desc sort every later page is
+          // older still.
+          reached_floor: trimmedOut > 0,
           // Kept rather than dropped — a match whose ts can't be read is
           // unknown, not out of window.
           ...(unparsableTs > 0 ? { kept_unparsable_ts: unparsableTs } : {}),
         },
         total: res.messages?.total,
-        matches: kept,
+        ...(responseIsUsable
+          ? { matches: kept }
+          : {
+              response_incomplete:
+                "search.messages returned no 'messages.matches' array. This is NOT the same as zero mentions — the window was not searched. Retry before concluding anything.",
+            }),
         paging: res.messages?.paging,
       });
     })

@@ -17,7 +17,12 @@ export function createIdentityLookup(client: WebClient): () => Promise<string> {
 }
 
 export interface TimezoneResolution {
-  /** IANA timezone name, guaranteed to be one Intl recognizes. */
+  /**
+   * A timezone Intl recognizes. Usually an IANA zone name — but Intl also
+   * accepts fixed offsets ("+05:30") and legacy abbreviations ("EST"), and a
+   * value taken from process.env.TZ can be either, so downstream code must
+   * not assume a full IANA zone with DST rules.
+   */
   tz: string;
   /** Where it came from. Anything but "slack" is a degraded answer. */
   source: "slack" | "env" | "system";
@@ -36,12 +41,19 @@ export interface TimezoneResolution {
  * timezone shifts a search window by a day and looks exactly like a quiet
  * day in Slack.
  *
- * A successful lookup is memoized for the life of the process; a failure is
- * not, so a transient API error doesn't pin the process to the fallback.
+ * A successful lookup is memoized for the life of the process, so a
+ * transient API error never pins the process to the fallback. A failure is
+ * cached only briefly (FAILURE_TTL_MS): long enough that a persistent
+ * problem — a token without `users:read`, a rate-limited workspace — doesn't
+ * re-pay the WebClient's retry budget on every single call, short enough
+ * that recovery is picked up on its own.
  */
+export const FAILURE_TTL_MS = 60_000;
+
 export function createTimezoneLookup(
   client: WebClient,
-  getMyUserId: () => Promise<string>
+  getMyUserId: () => Promise<string>,
+  now: () => number = Date.now
 ): () => Promise<TimezoneResolution> {
   const fetchSlackTz = memoizeWithTtl(async () => {
     const userId = await getMyUserId();
@@ -56,21 +68,34 @@ export function createTimezoneLookup(
     return tz;
   }, Infinity);
 
+  let lastFailure: { at: number; resolution: TimezoneResolution } | undefined;
+
   return async () => {
+    if (lastFailure && now() - lastFailure.at < FAILURE_TTL_MS) {
+      return lastFailure.resolution;
+    }
+
     let reason: string;
     try {
-      return { tz: await fetchSlackTz(), source: "slack" };
+      const resolved = { tz: await fetchSlackTz(), source: "slack" as const };
+      lastFailure = undefined;
+      return resolved;
     } catch (err) {
       reason = err instanceof Error ? err.message : String(err);
     }
 
+    const degraded = (resolution: TimezoneResolution): TimezoneResolution => {
+      lastFailure = { at: now(), resolution };
+      return resolution;
+    };
+
     const envTz = process.env.TZ;
     if (isValidTimeZone(envTz)) {
-      return {
+      return degraded({
         tz: envTz as string,
         source: "env",
         error: `Could not read the Slack user's timezone (${reason}); fell back to process.env.TZ.`,
-      };
+      });
     }
 
     let systemTz: string | undefined;
@@ -80,17 +105,17 @@ export function createTimezoneLookup(
       systemTz = undefined;
     }
     if (isValidTimeZone(systemTz)) {
-      return {
+      return degraded({
         tz: systemTz as string,
         source: "system",
         error: `Could not read the Slack user's timezone (${reason}); fell back to this host's timezone.`,
-      };
+      });
     }
 
-    return {
+    return degraded({
       tz: "UTC",
       source: "system",
-      error: `Could not read the Slack user's timezone (${reason}) and this host reports no usable timezone; fell back to UTC. Date-filtered results may be off by a day.`,
-    };
+      error: `Could not read the Slack user's timezone (${reason}) and this host reports no usable timezone; fell back to UTC.`,
+    });
   };
 }

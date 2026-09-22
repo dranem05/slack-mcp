@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createIdentityLookup, createTimezoneLookup } from "../src/utils/identity.js";
+import {
+  createIdentityLookup,
+  createTimezoneLookup,
+  FAILURE_TTL_MS,
+} from "../src/utils/identity.js";
 
 function fakeClient(userId: string | undefined) {
   const authTest = vi.fn(async () => ({ ok: true, user_id: userId }));
@@ -95,7 +99,7 @@ describe("createTimezoneLookup", () => {
   });
 
   it("treats a missing tz field as a failure rather than a blank answer", async () => {
-    const client = fakeTzClient({ name: "sam" });
+    const client = fakeTzClient({ name: "example-user" });
     const getMyTimezone = createTimezoneLookup(client as never, getMyUserId);
 
     const res = await getMyTimezone();
@@ -122,8 +126,9 @@ describe("createTimezoneLookup", () => {
     expect(res.error).toBeTruthy();
   });
 
-  it("does not cache a failure — a later success still wins", async () => {
+  it("does not cache a failure past its short TTL — a later success still wins", async () => {
     let fail = true;
+    let t = 0;
     const client = {
       users: {
         info: vi.fn(async () => {
@@ -132,13 +137,52 @@ describe("createTimezoneLookup", () => {
         }),
       },
     };
-    const getMyTimezone = createTimezoneLookup(client as never, getMyUserId);
+    const getMyTimezone = createTimezoneLookup(client as never, getMyUserId, () => t);
 
     expect((await getMyTimezone()).source).not.toBe("slack");
     fail = false;
+    t += FAILURE_TTL_MS;
     expect(await getMyTimezone()).toEqual({
       tz: "America/New_York",
       source: "slack",
     });
+  });
+
+  it("caches a failure briefly, so a persistent outage doesn't re-pay the retry budget every call", async () => {
+    let t = 0;
+    const client = fakeTzClient(undefined, { fail: true });
+    const getMyTimezone = createTimezoneLookup(client as never, getMyUserId, () => t);
+
+    await getMyTimezone();
+    t += FAILURE_TTL_MS - 1;
+    await getMyTimezone();
+    await getMyTimezone();
+
+    expect(client.users.info).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries once the failure TTL has elapsed", async () => {
+    let t = 0;
+    const client = fakeTzClient(undefined, { fail: true });
+    const getMyTimezone = createTimezoneLookup(client as never, getMyUserId, () => t);
+
+    await getMyTimezone();
+    t += FAILURE_TTL_MS;
+    await getMyTimezone();
+
+    expect(client.users.info).toHaveBeenCalledTimes(2);
+  });
+
+  it("still explains the degradation on a TTL-cached failure", async () => {
+    let t = 0;
+    process.env.TZ = "Asia/Tokyo";
+    const client = fakeTzClient(undefined, { fail: true });
+    const getMyTimezone = createTimezoneLookup(client as never, getMyUserId, () => t);
+
+    await getMyTimezone();
+    t += 1;
+    const cached = await getMyTimezone();
+    expect(cached.source).toBe("env");
+    expect(cached.error).toMatch(/ratelimited/);
   });
 });
