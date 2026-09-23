@@ -35,6 +35,7 @@ import {
   textPreview,
   tsAfter,
   tsNumber,
+  buildPermalink,
   type BotResolver,
   type BotVerdict,
   type Outcome,
@@ -201,13 +202,6 @@ function permalinkOrigin(permalink: string | undefined): string | undefined {
   }
 }
 
-// Deterministic construction, not a Slack-returned permalink.
-function buildPermalink(origin: string | undefined, channel: string, ts: string | undefined, rootTs?: string) {
-  if (!origin || !ts) return undefined;
-  const base = `${origin}/archives/${channel}/p${ts.replace(".", "")}`;
-  return rootTs && rootTs !== ts ? `${base}?thread_ts=${rootTs}&cid=${channel}` : base;
-}
-
 function freshnessEvidence(freshness: Freshness, newestTs: string | undefined, lastRead: string | undefined) {
   if (freshness === "cannot_check") {
     return lastRead === undefined ? "last_read absent — read state CANNOT-CHECK" : "ts unreadable — read state CANNOT-CHECK";
@@ -294,6 +288,8 @@ export interface DmUnit {
   newest_text?: string;
   newest_text_truncated?: true;
   last_read?: string;
+  /** Which declared cursor last_read came from: the conversation's, or the thread parent's when the newest is a thread reply. */
+  read_cursor: "conversation" | "thread";
   owes: "me" | "them";
   freshness: Freshness;
   acknowledged: boolean;
@@ -603,7 +599,12 @@ async function runDms(
     async (c): Promise<EvalResult<DmUnit>> => {
       const base = { scope: "dms" as const, channel_id: c.channel_id, channel_name: c.channel_name, ts: c.newest.ts };
       const newestTs = c.newest.ts as string;
+      // When the newest DM message is a thread reply, the conversation's
+      // last_read does not cover it — the thread parent's own last_read does.
+      const threadTs = permalinkThreadTs(c.newest.permalink);
+      const inThread = typeof threadTs === "string" && threadTs !== newestTs;
       let lastRead: string | undefined;
+      let readCursor: "conversation" | "thread" = "conversation";
       let message: ThreadMessage | undefined;
       try {
         // conversations.replies with a message's own ts returns that message
@@ -612,10 +613,20 @@ async function runDms(
         // 2026-09-22: 4 of 8 DM conversations' newest matches, including one
         // carrying my reaction) — so replies is the lookup.
         const [info, rep] = await Promise.all([
-          deps.client.conversations.info({ channel: c.channel_id }),
+          inThread
+            ? deps.client.conversations.replies({ channel: c.channel_id, ts: threadTs, limit: 1 })
+            : deps.client.conversations.info({ channel: c.channel_id }),
           deps.client.conversations.replies({ channel: c.channel_id, ts: newestTs, limit: 1 }),
         ]);
-        lastRead = (info.channel as { last_read?: string } | undefined)?.last_read;
+        if (inThread) {
+          readCursor = "thread";
+          const parent = (((info as { messages?: ThreadMessage[] }).messages ?? []) as ThreadMessage[]).find(
+            (m) => m.ts === threadTs
+          );
+          lastRead = parent?.last_read;
+        } else {
+          lastRead = ((info as { channel?: { last_read?: string } }).channel)?.last_read;
+        }
         message = ((rep.messages ?? []) as ThreadMessage[]).find((m) => m.ts === newestTs);
       } catch (err) {
         return { cannot: { ...base, level: "unit", reason: `lookup failed: ${errorMessage(err)}` } };
@@ -633,7 +644,6 @@ async function runDms(
 
       const freshness = freshnessOf(newestTs, lastRead);
       const e = verdictEvidence(newestTs, message.user, me, v);
-      const threadTs = permalinkThreadTs(c.newest.permalink);
       const preview = textPreview(message.text ?? c.newest.text);
       const unit: DmUnit = {
         kind: "dm",
@@ -651,18 +661,26 @@ async function runDms(
         ...(preview.text !== undefined ? { newest_text: preview.text } : {}),
         ...(preview.truncated ? { newest_text_truncated: true as const } : {}),
         ...(lastRead !== undefined ? { last_read: lastRead } : {}),
+        read_cursor: readCursor,
         owes: v.owes,
         freshness,
         acknowledged: v.acknowledged,
         ...(c.newest.permalink ? { permalink: c.newest.permalink } : {}),
         evidence:
           `newest in-window match ts=${newestTs} ${e.who} → owes ${v.owes}; ` +
-          `${freshnessEvidence(freshness, newestTs, lastRead)}; ${e.ack}${e.bot}`,
+          `${freshnessEvidence(freshness, newestTs, lastRead)} [${readCursor} cursor]; ${e.ack}${e.bot}`,
         ...(params.include_raw ? { raw: { match: c.newest, message } } : {}),
       };
       const freshnessGap: CannotCheckEntry | undefined =
         freshness === "cannot_check"
-          ? { ...base, level: "freshness", reason: "conversations.info returned no last_read — read state unknown", permalink: unit.permalink }
+          ? {
+              ...base,
+              level: "freshness",
+              reason: inThread
+                ? "thread parent returned no last_read (subscribed: false) — read state unknown"
+                : "conversations.info returned no last_read — read state unknown",
+              permalink: unit.permalink,
+            }
           : undefined;
       return { unit, freshnessGap };
     }

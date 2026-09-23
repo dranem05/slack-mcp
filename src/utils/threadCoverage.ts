@@ -146,3 +146,16 @@ export function requirePositiveNumber(value: number, field: string): number {
   }
   return value;
 }
+
+// Deterministic permalink construction (conversations.history/replies return
+// none). `origin` is the workspace URL with or without a trailing slash.
+export function buildPermalink(
+  origin: string | undefined,
+  channel: string,
+  ts: string | undefined,
+  rootTs?: string
+): string | undefined {
+  if (!origin || !ts) return undefined;
+  const base = `${origin.replace(/\/+$/, "")}/archives/${channel}/p${ts.replace(".", "")}`;
+  return rootTs && rootTs !== ts ? `${base}?thread_ts=${rootTs}&cid=${channel}` : base;
+}

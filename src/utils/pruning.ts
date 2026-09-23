@@ -3,6 +3,8 @@
 // noise for an LLM reading tool output — these functions cut each down to
 // the handful of fields actually useful for a conversation/drafts workflow.
 
+import { textPreview, TEXT_PREVIEW_LIMIT } from "./threadCoverage.js";
+
 // Structural subset of @slack/web-api's MessageElement (history & replies
 // each define their own near-identical copy of this type, so we don't
 // import either directly — any object with at least these fields works).
@@ -542,7 +544,7 @@ export interface PrunedSearchMatch {
   is_bot?: true;
 }
 
-export const SEARCH_MATCH_TEXT_LIMIT = 200;
+export const SEARCH_MATCH_TEXT_LIMIT = TEXT_PREVIEW_LIMIT;
 
 // The root a search match belongs to, read from its permalink.
 //   string    — the permalink names a thread root (the match is a reply, or a root with replies)
@@ -576,14 +578,9 @@ export function pruneSearchMatch(
   };
   const threadTs = permalinkThreadTs(match.permalink);
   if (typeof threadTs === "string") pruned.thread_ts = threadTs;
-  if (typeof match.text === "string") {
-    if (match.text.length > SEARCH_MATCH_TEXT_LIMIT) {
-      pruned.text = match.text.slice(0, SEARCH_MATCH_TEXT_LIMIT);
-      pruned.truncated = true;
-    } else {
-      pruned.text = match.text;
-    }
-  }
+  const preview = textPreview(match.text);
+  if (preview.text !== undefined) pruned.text = preview.text;
+  if (preview.truncated) pruned.truncated = true;
   if (!match.user || botUserIds.has(match.user)) pruned.is_bot = true;
   return pruned;
 }

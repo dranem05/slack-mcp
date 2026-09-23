@@ -26,6 +26,7 @@ import {
   textPreview,
   tsAfter,
   tsNumber,
+  buildPermalink,
   type BotResolver,
   type Outcome,
 } from "../../utils/threadCoverage.js";
@@ -48,6 +49,7 @@ export interface ChannelDigestParams {
 interface HistoryMessage {
   ts?: string;
   user?: string;
+  subtype?: string;
   username?: string;
   text?: string;
   reply_count?: number;
@@ -58,11 +60,18 @@ interface HistoryMessage {
 
 type IsBot = boolean | "cannot_check";
 
+// Message subtypes that are still a person posting. Every other subtype
+// (channel_join, channel_topic, pinned_item, …) is a Slack system event and
+// never counts toward new_top_level_human.
+const HUMAN_SUBTYPES = new Set(["thread_broadcast", "file_share", "me_message"]);
+
 export interface DigestRoot {
   ts?: string;
   user?: string;
   username?: string;
   is_bot: IsBot;
+  by_me?: true;
+  subtype?: string;
   text?: string;
   truncated?: true;
   reply_count?: number;
@@ -122,17 +131,22 @@ export async function runChannelDigest(deps: ChannelDigestDeps, params: ChannelD
 
   // Permalink base from auth.test().url — deterministic construction, since
   // conversations.history returns no permalinks.
+  // auth.test also names me: my own posts are never "new" to me.
   let teamUrl: string | undefined;
+  let me: string | undefined;
   let permalinkError: string | undefined;
   try {
     const auth = await deps.client.auth.test();
-    teamUrl = typeof auth.url === "string" ? auth.url.replace(/\/?$/, "/") : undefined;
+    teamUrl = typeof auth.url === "string" && auth.url ? auth.url : undefined;
+    me = typeof auth.user_id === "string" ? auth.user_id : undefined;
     if (!teamUrl) permalinkError = "auth.test returned no url";
   } catch (err) {
     permalinkError = errorMessage(err);
   }
-  const permalink = (channel: string, ts: string | undefined) =>
-    teamUrl && ts ? `${teamUrl}archives/${channel}/p${ts.replace(".", "")}` : undefined;
+  if (!me) {
+    // Without knowing who I am, "new from someone else" is unmeasurable.
+    throw new Error(`Could not determine the authenticated user (auth.test: ${permalinkError ?? "no user_id"}).`);
+  }
 
   const settled = await mapWithConcurrencySettled(ids, concurrency, async (id) => {
     try {
@@ -158,45 +172,65 @@ export async function runChannelDigest(deps: ChannelDigestDeps, params: ChannelD
     let newTopHuman = 0;
     let moved = 0;
     let unknown = 0;
-    const roots: DigestRoot[] = [];
 
+    interface Classified {
+      m: HistoryMessage;
+      isNew?: boolean;
+      threadMoved?: boolean;
+      readState?: "own" | "unknown";
+      movedSinceChannelRead?: boolean;
+    }
+    const classified: Classified[] = [];
     for (const m of messages) {
       const isNew = channelLastRead === undefined ? undefined : tsAfter(m.ts, channelLastRead);
-      const hasReplies = typeof m.reply_count === "number" && m.reply_count > 0 && m.latest_reply !== undefined;
-      let threadMoved: boolean | undefined;
-      let readState: "own" | "unknown" | undefined;
-      let movedSinceChannelRead: boolean | undefined;
-      if (hasReplies) {
-        if (m.last_read !== undefined) {
-          readState = "own";
-          threadMoved = tsAfter(m.latest_reply, m.last_read);
-          if (threadMoved === undefined) readState = "unknown";
+      const c: Classified = { m, isNew };
+      if (typeof m.reply_count === "number" && m.reply_count > 0) {
+        if (m.latest_reply !== undefined && m.last_read !== undefined) {
+          c.threadMoved = tsAfter(m.latest_reply, m.last_read);
+          c.readState = c.threadMoved === undefined ? "unknown" : "own";
         } else {
-          readState = "unknown";
+          // No own cursor (subscribed:false), or replies with no declared
+          // latest_reply: the thread's read state is unknown, never "read".
+          c.readState = "unknown";
         }
-        if (readState === "unknown") {
+        if (c.readState === "unknown") {
           unknown++;
-          movedSinceChannelRead = channelLastRead === undefined ? undefined : tsAfter(m.latest_reply, channelLastRead);
+          c.movedSinceChannelRead =
+            channelLastRead === undefined ? undefined : tsAfter(m.latest_reply, channelLastRead);
         }
-        if (threadMoved) moved++;
+        if (c.threadMoved) moved++;
       }
-      const interesting = isNew === true || threadMoved === true || readState === "unknown";
-      if (!interesting && isNew !== undefined) continue;
+      const interesting = isNew !== false || c.threadMoved === true || c.readState === "unknown";
+      if (interesting) classified.push(c);
+    }
 
-      const bot = await isBotOf(bots, m.user);
+    // Resolve distinct authors in parallel (cached per run), then build rows.
+    const authors = [...new Set(classified.map((c) => c.m.user).filter((u): u is string => !!u))];
+    const verdicts = new Map<string, Awaited<ReturnType<typeof isBotOf>>>();
+    await Promise.all(authors.map(async (u) => verdicts.set(u, await isBotOf(bots, u))));
+
+    const roots: DigestRoot[] = [];
+    for (const { m, isNew, threadMoved, readState, movedSinceChannelRead } of classified) {
+      const bot = m.user ? (verdicts.get(m.user) as Awaited<ReturnType<typeof isBotOf>>) : await isBotOf(bots, undefined);
       if (bot.error) {
         gaps.push({ level: "bot", channel_id: id, channel_name: ch.name, ts: m.ts, reason: `bot_lookup_failed: ${bot.error}` });
       }
+      const byMe = m.user === me;
       if (isNew === true) {
         newTop++;
-        if (bot.is_bot === false) newTopHuman++;
+        // "Human" = someone else, users.info says not a bot, and not a Slack
+        // system event (join/leave/topic…): declared subtype, not content.
+        if (bot.is_bot === false && !byMe && (!m.subtype || HUMAN_SUBTYPES.has(m.subtype))) newTopHuman++;
       }
       const preview = textPreview(m.text);
+      const link = buildPermalink(teamUrl, id, m.ts);
       roots.push({
         ts: m.ts,
         ...(m.user !== undefined ? { user: m.user } : {}),
         ...((m.username ?? bot.name) ? { username: m.username ?? bot.name } : {}),
         is_bot: bot.is_bot,
+        ...(byMe ? { by_me: true as const } : {}),
+        ...(m.subtype ? { subtype: m.subtype } : {}),
         ...(preview.text !== undefined ? { text: preview.text } : {}),
         ...(preview.truncated ? { truncated: true as const } : {}),
         ...(m.reply_count !== undefined ? { reply_count: m.reply_count } : {}),
@@ -207,7 +241,7 @@ export async function runChannelDigest(deps: ChannelDigestDeps, params: ChannelD
         ...(threadMoved !== undefined ? { thread_moved: threadMoved } : {}),
         ...(readState ? { read_state: readState } : {}),
         ...(movedSinceChannelRead !== undefined ? { moved_since_channel_read: movedSinceChannelRead } : {}),
-        ...(permalink(id, m.ts) ? { permalink: permalink(id, m.ts) } : {}),
+        ...(link ? { permalink: link } : {}),
       });
     }
 

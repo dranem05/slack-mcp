@@ -425,3 +425,40 @@ describe("slack_my_threads — dms scope", () => {
     expect(out.residual_gap).toMatch(/not enumerable/);
   });
 });
+
+describe("slack_my_threads — review round 1", () => {
+  it("a DM newest that is a thread reply is judged against the thread parent's last_read, not the conversation's", async () => {
+    const D1 = "D0B00000001";
+    const root = "1790100000.000100";
+    const reply = "1790110000.000100";
+    const base: FakeSlackOptions = {
+      dmPages: [[match(D1, reply, { user: ALICE, im: true, root })]],
+      // conversation cursor is behind — would read "unseen"
+      info: { [D1]: { last_read: "1790000000.000100" } },
+    };
+    const seen = await run(
+      {
+        ...base,
+        replies: {
+          [`${D1}|${reply}`]: [{ ts: reply, user: ALICE, thread_ts: root }],
+          [`${D1}|${root}`]: [{ ts: root, user: ME, reply_count: 1, latest_reply: reply, last_read: reply, subscribed: true }],
+        },
+      },
+      { scope: "dms" }
+    );
+    expect(seen.out.units[0]).toMatchObject({ read_cursor: "thread", freshness: "seen", last_read: reply });
+    expect(seen.client.conversations.info).not.toHaveBeenCalled();
+
+    const unsub = await run(
+      {
+        ...base,
+        replies: {
+          [`${D1}|${reply}`]: [{ ts: reply, user: ALICE, thread_ts: root }],
+          [`${D1}|${root}`]: [{ ts: root, user: ME, reply_count: 1, latest_reply: reply, subscribed: false }],
+        },
+      },
+      { scope: "dms" }
+    );
+    expect(unsub.out.units[0]).toMatchObject({ read_cursor: "thread", freshness: "cannot_check" });
+  });
+});

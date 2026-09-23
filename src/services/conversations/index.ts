@@ -558,7 +558,9 @@ export function registerConversationsTools(
       "never 'read'. Window is a days floor (horizon_days): roots posted before it are not examined even if their " +
       "threads moved. has_more from history → truncated: true (partial). A requested id that fails is a skipped " +
       "cannot_check entry, not an omission. Permalinks are constructed from auth.test's url, not returned by Slack. " +
-      "outcome: FINDINGS (human new posts or moved threads), CLEAN (all resolved, nothing new, no gaps), CANNOT_CHECK.",
+      "new_top_level_human counts only posts by someone other than you, not a bot, and not a Slack system event " +
+      "(declared subtype such as channel_join). outcome: FINDINGS (human new posts or moved threads), CLEAN (all " +
+      "resolved, nothing new, no gaps), CANNOT_CHECK.",
     {
       channel_ids: z.string().describe("Comma-separated channel ids from the caller's policy file."),
       days: z

@@ -138,3 +138,45 @@ describe("slack_channel_digest", () => {
     expect(out.outcome).toBe("CANNOT_CHECK");
   });
 });
+
+describe("slack_channel_digest — review round 1", () => {
+  it("my own posts and system-subtype events are counted raw but never as human new", async () => {
+    const { out } = await run({
+      info: { [PRODUCT]: { name: "-product", last_read: t("10:00") } },
+      history: {
+        [PRODUCT]: {
+          messages: [
+            { ts: t("12:00"), user: ME, text: "mine" },
+            { ts: t("11:30"), user: "U2", subtype: "channel_join", text: "<@U2> has joined the channel" },
+            { ts: t("11:00"), user: "U2", subtype: "thread_broadcast", text: "also sent to channel" },
+          ],
+        },
+      },
+      users: { ...HUMANS, [ME]: { is_bot: false, name: "sam" } },
+    });
+    const ch = out.channels[0];
+    expect(ch).toMatchObject({ new_top_level: 3, new_top_level_human: 1 });
+    expect(ch.roots.find((r) => r.ts === t("12:00"))).toMatchObject({ by_me: true });
+    expect(ch.roots.find((r) => r.ts === t("11:30"))).toMatchObject({ subtype: "channel_join" });
+    expect(out.outcome).toBe("FINDINGS");
+  });
+
+  it("only-mine / only-system new posts do not make FINDINGS", async () => {
+    const { out } = await run({
+      info: { [PRODUCT]: { name: "-product", last_read: t("10:00") } },
+      history: { [PRODUCT]: { messages: [{ ts: t("12:00"), user: ME }, { ts: t("11:30"), user: "U2", subtype: "channel_join" }] } },
+      users: { ...HUMANS, [ME]: { is_bot: false } },
+    });
+    expect(out.channels[0].new_top_level_human).toBe(0);
+    expect(out.outcome).toBe("CLEAN");
+  });
+
+  it("replies with no declared latest_reply are unknown_read_state, not silently skipped", async () => {
+    const { out } = await run({
+      info: { [PRODUCT]: { name: "-product", last_read: t("13:00") } },
+      history: { [PRODUCT]: { messages: [{ ts: t("11:08"), user: "U1", reply_count: 3, last_read: t("11:22") }] } },
+    });
+    expect(out.channels[0].unknown_read_state).toBe(1);
+    expect(out.outcome).toBe("CANNOT_CHECK");
+  });
+});
