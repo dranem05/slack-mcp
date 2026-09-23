@@ -236,37 +236,87 @@ function freshnessOf(newestTs: string | undefined, lastRead: string | undefined)
   return after ? "unseen" : "seen";
 }
 
+type Owes = "me" | "them" | "nobody";
+
+// How far to look back for a human when the newest messages are bots.
+export const TURN_EXTENDED_LIMIT = 50;
+
+async function botOf(m: ThreadMessage, me: string, bots: BotResolver): Promise<BotVerdict> {
+  // My own message needs no lookup, so a failing users.info(me) cannot turn
+  // my own turn into CANNOT-CHECK.
+  return m.user === me ? { is_bot: false, source: "self" } : bots.resolve(m.user);
+}
+
+// The turn message: the newest NON-bot message at or before `ceilingTs`, by
+// numeric ts (never array position). Bots never take the turn — a bot posting
+// after a human ask must not hide the ask. Rejects if a bot lookup fails.
+async function findTurn(
+  messages: readonly ThreadMessage[],
+  ceilingTs: string | undefined,
+  me: string,
+  bots: BotResolver
+): Promise<ThreadMessage | undefined> {
+  const ceiling = tsNumber(ceilingTs) ?? Number.POSITIVE_INFINITY;
+  const ordered = messages
+    .filter((m) => (tsNumber(m.ts) ?? Number.POSITIVE_INFINITY) <= ceiling)
+    .sort((a, b) => (tsNumber(b.ts) as number) - (tsNumber(a.ts) as number));
+  for (const m of ordered) {
+    if (!(await botOf(m, me, bots)).is_bot) return m;
+  }
+  return undefined;
+}
+
+// replies(root, limit) returns the parent plus the latest `limit` replies —
+// NOT a contiguous run when replies are cut. The parent may only take the
+// turn when every reply is present; otherwise an older human parent would
+// stand in for replies that were never looked at.
+function turnCandidates(messages: readonly ThreadMessage[], rootTs: string | undefined, replyCount: number | undefined) {
+  const replies = messages.filter((m) => m.ts !== rootTs);
+  const complete = typeof replyCount === "number" && replies.length >= replyCount;
+  return complete ? [...messages] : replies;
+}
+
 interface Verdict {
-  owes: "me" | "them";
+  owes: Owes;
   acknowledged: boolean;
   newest_is_bot: boolean;
   newest_bot_source: BotVerdict["source"];
   newest_username?: string;
 }
 
-async function verdictFor(
-  newest: ThreadMessage,
-  me: string,
-  bots: BotResolver
-): Promise<Verdict> {
-  // My own message: owes is "them" and bot status is moot — no lookup, so a
-  // failing users.info(me) cannot turn my own turn into CANNOT-CHECK.
-  const bot: BotVerdict =
-    newest.user === me ? { is_bot: false, source: "self" } : await bots.resolve(newest.user);
+function buildVerdict(newestBot: BotVerdict, newest: ThreadMessage, turn: ThreadMessage | undefined, me: string): Verdict {
+  const name = newest.username ?? newestBot.name;
   return {
-    owes: newest.user === me ? "them" : "me",
-    acknowledged: reactedBy(newest.reactions, me),
-    newest_is_bot: bot.is_bot,
-    newest_bot_source: bot.source,
-    ...(newest.username ?? bot.name ? { newest_username: newest.username ?? bot.name } : {}),
+    owes: turn === undefined ? "nobody" : turn.user === me ? "them" : "me",
+    // Read from the turn message: reacting to the human ask is the ack.
+    acknowledged: turn !== undefined && reactedBy(turn.reactions, me),
+    newest_is_bot: newestBot.is_bot,
+    newest_bot_source: newestBot.source,
+    ...(name ? { newest_username: name } : {}),
   };
 }
 
-function verdictEvidence(newestTs: string | undefined, newestUser: string | undefined, me: string, v: Verdict) {
-  const who = newestUser === undefined ? "no user (app post)" : `user ${newestUser} ${newestUser === me ? "== me" : "!= me"}`;
-  const ack = v.acknowledged ? "my reaction on newest (acknowledged)" : "no reaction from me on newest";
-  const bot = v.newest_is_bot ? `; bot via ${v.newest_bot_source}` : "";
-  return { who, ack, bot, ts: newestTs };
+function turnFields(turn: ThreadMessage | undefined) {
+  return turn
+    ? {
+        turn_ts: turn.ts,
+        ...(turn.user !== undefined ? { turn_user: turn.user } : {}),
+        ...(turn.username ? { turn_username: turn.username } : {}),
+      }
+    : {};
+}
+
+function verdictEvidence(newest: ThreadMessage, turn: ThreadMessage | undefined, me: string, v: Verdict) {
+  const whoOf = (m: ThreadMessage) =>
+    m.user === undefined ? "no user (app post)" : `user ${m.user} ${m.user === me ? "== me" : "!= me"}`;
+  const turnText =
+    turn === undefined
+      ? "no human in the conversation (1:1 IM with a bot) → owes nobody"
+      : turn === newest
+        ? `${whoOf(newest)} → owes ${v.owes}`
+        : `newest is a bot (via ${v.newest_bot_source}); turn = newest non-bot ts=${turn.ts} ${whoOf(turn)} → owes ${v.owes}`;
+  const ack = v.acknowledged ? "my reaction on the turn message (acknowledged)" : "no reaction from me on the turn message";
+  return { turnText, ack };
 }
 
 export interface ThreadUnit {
@@ -285,7 +335,11 @@ export interface ThreadUnit {
   newest_bot_source: BotVerdict["source"];
   newest_text?: string;
   newest_text_truncated?: true;
-  owes: "me" | "them";
+  /** The newest non-bot message — what owes and acknowledged are read from. */
+  turn_ts?: string;
+  turn_user?: string;
+  turn_username?: string;
+  owes: Owes;
   freshness: Freshness;
   acknowledged: boolean;
   permalink?: string;
@@ -312,7 +366,10 @@ export interface DmUnit {
   last_read?: string;
   /** Which declared cursor last_read came from: the conversation's, or the thread parent's when the newest is a thread reply. */
   read_cursor: "conversation" | "thread";
-  owes: "me" | "them";
+  turn_ts?: string;
+  turn_user?: string;
+  turn_username?: string;
+  owes: Owes;
   freshness: Freshness;
   acknowledged: boolean;
   permalink?: string;
@@ -322,8 +379,10 @@ export interface DmUnit {
 
 type EvalResult<U> = { unit: U; freshnessGap?: CannotCheckEntry } | { cannot: CannotCheckEntry };
 
-function isRow(u: { owes: string; acknowledged: boolean; newest_is_bot: boolean }) {
-  return u.owes === "me" && !u.acknowledged && !u.newest_is_bot;
+// The turn message is non-bot by construction, so a bot posting last can no
+// longer hide a human ask; newest_is_bot is information only.
+function isRow(u: { owes: string; acknowledged: boolean }) {
+  return u.owes === "me" && !u.acknowledged;
 }
 
 // ---------------------------------------------------------------- threads
@@ -409,6 +468,7 @@ async function runThreads(
     }
   }
 
+  let noHuman = 0;
   const ordered = [...candidates.values()].sort((a, b) => b.newest_match_ts - a.newest_match_ts);
   const toEvaluate = ordered.slice(0, params.max_units);
   const capped = ordered.length - toEvaluate.length;
@@ -419,9 +479,17 @@ async function runThreads(
     async (c): Promise<EvalResult<ThreadUnit>> => {
       const base = { scope: "threads" as const, channel_id: c.channel_id, channel_name: c.channel_name, root_ts: c.root_ts };
       let messages: ThreadMessage[];
+      let hasMore = false;
       try {
+        // UNDOCUMENTED Slack behaviour this relies on: with `limit`, replies
+        // returns the parent plus the LATEST `limit` replies (verified live
+        // 2026-09-22 on limit 2 and 3; 23/23 + 16/16 threads). If Slack ever
+        // returned the oldest replies instead, the ts === latest_reply lookup
+        // below finds nothing and the unit is CANNOT-CHECK
+        // (newest_not_in_window) — a loud failure, never a wrong verdict.
         const res = await deps.client.conversations.replies({ channel: c.channel_id, ts: c.root_ts, limit: 3 });
         messages = (res.messages ?? []) as ThreadMessage[];
+        hasMore = res.has_more === true;
       } catch (err) {
         return { cannot: { ...base, level: "unit", reason: `conversations.replies failed: ${errorMessage(err)}` } };
       }
@@ -430,7 +498,11 @@ async function runThreads(
         return { cannot: { ...base, level: "unit", reason: "root_not_returned — replies did not return the root ts" } };
       }
       let newest: ThreadMessage | undefined;
-      if (typeof parent.reply_count !== "number" || parent.reply_count === 0) {
+      if (typeof parent.reply_count !== "number") {
+        // The permalink declared a thread; a parent that declares no
+        // reply_count contradicts it. Unknown, not "the root is newest".
+        return { cannot: { ...base, level: "unit", reason: "reply_count absent on a declared thread root (permalink carries thread_ts)" } };
+      } else if (parent.reply_count === 0) {
         newest = parent;
       } else if (parent.latest_reply === undefined) {
         return { cannot: { ...base, level: "unit", reason: "latest_reply absent on a parent with reply_count" } };
@@ -442,8 +514,33 @@ async function runThreads(
       }
 
       let v: Verdict;
+      let turn: ThreadMessage | undefined;
       try {
-        v = await verdictFor(newest, me, bots);
+        const newestBot = await botOf(newest, me, bots);
+        turn = newestBot.is_bot
+          ? await findTurn(turnCandidates(messages, c.root_ts, parent.reply_count), newest.ts, me, bots)
+          : newest;
+        if (!turn && hasMore) {
+          const more = await deps.client.conversations.replies({
+            channel: c.channel_id,
+            ts: c.root_ts,
+            limit: TURN_EXTENDED_LIMIT,
+          });
+          messages = (more.messages ?? []) as ThreadMessage[];
+          turn = await findTurn(turnCandidates(messages, c.root_ts, parent.reply_count), newest.ts, me, bots);
+        }
+        if (!turn) {
+          noHuman++;
+          return {
+            cannot: {
+              ...base,
+              level: "unit",
+              ts: newest.ts,
+              reason: `no_human_in_window — the newest ${messages.length} returned messages are all bots; whose turn it is is unknown`,
+            },
+          };
+        }
+        v = buildVerdict(newestBot, newest, turn, me);
       } catch (err) {
         return {
           cannot: { ...base, level: "unit", ts: newest.ts, reason: `bot_lookup_failed: ${errorMessage(err)}` },
@@ -452,7 +549,7 @@ async function runThreads(
 
       const latestRef = parent.latest_reply ?? parent.ts;
       const freshness = freshnessOf(latestRef, parent.last_read);
-      const e = verdictEvidence(newest.ts, newest.user, me, v);
+      const e = verdictEvidence(newest, turn, me, v);
       const newestRef = newest === parent ? "newest = root (no replies)" : `newest ts=latest_reply ${newest.ts}`;
       const preview = textPreview(newest.text);
       const unit: ThreadUnit = {
@@ -471,15 +568,16 @@ async function runThreads(
         newest_bot_source: v.newest_bot_source,
         ...(preview.text !== undefined ? { newest_text: preview.text } : {}),
         ...(preview.truncated ? { newest_text_truncated: true as const } : {}),
+        ...turnFields(turn),
         owes: v.owes,
         freshness,
         acknowledged: v.acknowledged,
         permalink: buildPermalink(c.origin, c.channel_id, newest.ts, c.root_ts),
         evidence:
-          `${newestRef} ${e.who} → owes ${v.owes}; ` +
+          `${newestRef}: ${e.turnText}; ` +
           `${freshnessEvidence(freshness, latestRef, parent.last_read)}` +
           (parent.last_read === undefined && parent.subscribed !== undefined ? ` (subscribed: ${parent.subscribed})` : "") +
-          `; ${e.ack}${e.bot}`,
+          `; ${e.ack}`,
         ...(params.include_raw ? { raw: { messages } } : {}),
       };
       const freshnessGap: CannotCheckEntry | undefined =
@@ -532,6 +630,7 @@ async function runThreads(
     units_evaluated: units.length,
     units_skipped: unitSkips,
     capped,
+    no_human_in_window: noHuman,
     freshness_cannot_check: units.filter((u) => u.freshness === "cannot_check").length,
   };
 
@@ -549,6 +648,8 @@ async function runThreads(
 // -------------------------------------------------------------------- dms
 
 interface DmCandidate {
+  /** Every in-window match of the unit, newest first. */
+  matches: SearchMatch[];
   channel_id: string;
   thread_root_ts?: string;
   channel_name?: string;
@@ -630,11 +731,13 @@ async function runDms(
       is_im: first.channel?.is_im,
       is_mpim: first.channel?.is_mpim,
       ...(root ? { thread_root_ts: root } : {}),
+      matches: [...parsable].sort((a, b) => (tsNumber(b.ts) as number) - (tsNumber(a.ts) as number)),
       newest,
       count: g.matches.length,
     });
   }
 
+  let noHuman = 0;
   candidates.sort((a, b) => (tsNumber(b.newest.ts) as number) - (tsNumber(a.newest.ts) as number));
   const toEvaluate = candidates.slice(0, params.max_units);
   const capped = candidates.length - toEvaluate.length;
@@ -657,29 +760,39 @@ async function runDms(
       const inThread = threadTs !== undefined;
       let lastRead: string | undefined;
       let readCursor: "conversation" | "thread" = "conversation";
+      let counterpart: string | undefined;
+      let isIm = c.is_im;
       let message: ThreadMessage | undefined;
+      const fetchOne = async (t: string) => {
+        const r = await deps.client.conversations.replies({ channel: c.channel_id, ts: t, limit: 1 });
+        return ((r.messages ?? []) as ThreadMessage[]).find((m) => m.ts === t);
+      };
       try {
         // conversations.replies with a message's own ts returns that message
         // whether it is a thread reply, a root, or standalone. history with
         // latest=oldest=ts inclusive misses thread replies (verified live
         // 2026-09-22: 4 of 8 DM conversations' newest matches, including one
         // carrying my reaction) — so replies is the lookup.
-        const [info, rep] = await Promise.all([
+        const [info, parentRes, newestMsg] = await Promise.all([
+          deps.client.conversations.info({ channel: c.channel_id }),
           inThread
             ? deps.client.conversations.replies({ channel: c.channel_id, ts: threadTs, limit: 1 })
-            : deps.client.conversations.info({ channel: c.channel_id }),
-          deps.client.conversations.replies({ channel: c.channel_id, ts: newestTs, limit: 1 }),
+            : Promise.resolve(undefined),
+          fetchOne(newestTs),
         ]);
+        const ch = (info as { channel?: { last_read?: string; user?: string; is_im?: boolean } }).channel;
+        counterpart = ch?.user;
+        if (typeof ch?.is_im === "boolean") isIm = ch.is_im;
         if (inThread) {
           readCursor = "thread";
-          const parent = (((info as { messages?: ThreadMessage[] }).messages ?? []) as ThreadMessage[]).find(
+          const parent = (((parentRes as { messages?: ThreadMessage[] } | undefined)?.messages ?? []) as ThreadMessage[]).find(
             (m) => m.ts === threadTs
           );
           lastRead = parent?.last_read;
         } else {
-          lastRead = ((info as { channel?: { last_read?: string } }).channel)?.last_read;
+          lastRead = ch?.last_read;
         }
-        message = ((rep.messages ?? []) as ThreadMessage[]).find((m) => m.ts === newestTs);
+        message = newestMsg;
       } catch (err) {
         return { cannot: { ...base, level: "unit", reason: `lookup failed: ${errorMessage(err)}` } };
       }
@@ -688,14 +801,60 @@ async function runDms(
       }
 
       let v: Verdict;
+      let turn: ThreadMessage | undefined;
+      const newest: ThreadMessage = { ...message, username: message.username ?? c.newest.username };
       try {
-        v = await verdictFor({ ...message, username: message.username ?? c.newest.username }, me, bots);
+        const newestBot = await botOf(newest, me, bots);
+        if (!newestBot.is_bot) {
+          turn = newest;
+        } else {
+          // 1. older in-window matches of this unit, by their declared user
+          const older = c.matches.filter((m) => m.ts !== newestTs);
+          const humanMatch = await findTurn(older as ThreadMessage[], newestTs, me, bots);
+          if (humanMatch) {
+            const fetched = await fetchOne(humanMatch.ts as string);
+            if (!fetched) {
+              return { cannot: { ...base, level: "unit", reason: `turn_not_returned — replies(ts) did not return ${humanMatch.ts}` } };
+            }
+            turn = { ...fetched, username: fetched.username ?? humanMatch.username };
+          } else if (isIm && counterpart && (await bots.resolve(counterpart)).is_bot) {
+            // 2. a 1:1 IM whose other member is a bot: no human but me can
+            //    post here, and I am not in the window — owes nobody (declared).
+            turn = undefined;
+          } else {
+            // 3. look further back, bounded
+            const more = inThread
+              ? await deps.client.conversations.replies({ channel: c.channel_id, ts: threadTs, limit: TURN_EXTENDED_LIMIT })
+              : await deps.client.conversations.history({
+                  channel: c.channel_id,
+                  latest: newestTs,
+                  inclusive: true,
+                  limit: TURN_EXTENDED_LIMIT,
+                });
+            const moreMsgs = (more.messages ?? []) as ThreadMessage[];
+            const candidates = inThread
+              ? turnCandidates(moreMsgs, threadTs, moreMsgs.find((m) => m.ts === threadTs)?.reply_count)
+              : moreMsgs;
+            turn = await findTurn(candidates, newestTs, me, bots);
+            if (!turn) {
+              noHuman++;
+              return {
+                cannot: {
+                  ...base,
+                  level: "unit",
+                  reason: `no_human_in_window — the newest ${(more.messages ?? []).length} messages are all bots; whose turn it is is unknown`,
+                },
+              };
+            }
+          }
+        }
+        v = buildVerdict(newestBot, newest, turn, me);
       } catch (err) {
         return { cannot: { ...base, level: "unit", reason: `bot_lookup_failed: ${errorMessage(err)}` } };
       }
 
       const freshness = freshnessOf(newestTs, lastRead);
-      const e = verdictEvidence(newestTs, message.user, me, v);
+      const e = verdictEvidence(newest, turn, me, v);
       const preview = textPreview(message.text ?? c.newest.text);
       const unit: DmUnit = {
         kind: "dm",
@@ -714,13 +873,14 @@ async function runDms(
         ...(preview.truncated ? { newest_text_truncated: true as const } : {}),
         ...(lastRead !== undefined ? { last_read: lastRead } : {}),
         read_cursor: readCursor,
+        ...turnFields(turn),
         owes: v.owes,
         freshness,
         acknowledged: v.acknowledged,
         ...(c.newest.permalink ? { permalink: c.newest.permalink } : {}),
         evidence:
-          `newest in-window match ts=${newestTs} ${e.who} → owes ${v.owes}; ` +
-          `${freshnessEvidence(freshness, newestTs, lastRead)} [${readCursor} cursor]; ${e.ack}${e.bot}`,
+          `newest in-window match ts=${newestTs}: ${e.turnText}; ` +
+          `${freshnessEvidence(freshness, newestTs, lastRead)} [${readCursor} cursor]; ${e.ack}`,
         ...(params.include_raw ? { raw: { match: c.newest, message } } : {}),
       };
       const freshnessGap: CannotCheckEntry | undefined =
@@ -770,6 +930,7 @@ async function runDms(
     units_evaluated: units.length,
     units_skipped: unitSkips,
     capped,
+    no_human_in_window: noHuman,
     freshness_cannot_check: units.filter((u) => u.freshness === "cannot_check").length,
   };
   const blocking =

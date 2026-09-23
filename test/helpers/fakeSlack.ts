@@ -21,6 +21,14 @@ export interface FakeSlackOptions {
   /** users.info keyed by user id. */
   users?: Record<string, Msg | Error>;
   teamUrl?: string;
+  /**
+   * Which replies conversations.replies returns under `limit` when asked for
+   * a thread root. Live Slack (verified 2026-09-22, limit 2 and 3 on
+   * reply_count 10/12 threads) returns the parent plus the LATEST `limit`
+   * replies — "latest" models that. "oldest" models the documented-looking
+   * alternative so tests can prove the pipeline fails safe if Slack changes.
+   */
+  repliesWindow?: "latest" | "oldest";
 }
 
 export function fakeSlack(o: FakeSlackOptions = {}) {
@@ -58,17 +66,28 @@ export function fakeSlack(o: FakeSlackOptions = {}) {
       }),
     },
     conversations: {
-      replies: vi.fn(async ({ channel, ts }: { channel: string; ts: string }) => ({
-        ok: true,
-        messages: lookup(o.replies, `${channel}|${ts}`, "thread_not_found"),
-      })),
+      replies: vi.fn(async ({ channel, ts, limit }: { channel: string; ts: string; limit?: number }) => {
+        const all = lookup(o.replies, `${channel}|${ts}`, "thread_not_found");
+        const [parent, ...rest] = all;
+        if (limit === undefined || parent?.ts !== ts || rest.length <= limit) {
+          return { ok: true, messages: all, has_more: false };
+        }
+        const window = (o.repliesWindow ?? "latest") === "latest" ? rest.slice(-limit) : rest.slice(0, limit);
+        return { ok: true, messages: [parent, ...window], has_more: true };
+      }),
       info: vi.fn(async ({ channel }: { channel: string }) => ({
         ok: true,
         channel: lookup(o.info, channel, "channel_not_found"),
       })),
-      history: vi.fn(async ({ channel }: { channel: string }) => {
+      history: vi.fn(async ({ channel, limit }: { channel: string; limit?: number }) => {
         const h = lookup(o.history, channel, "channel_not_found");
-        return { ok: true, messages: h.messages, has_more: h.has_more ?? false };
+        // history is newest-first; honor limit the way Slack does.
+        const truncated = limit !== undefined && h.messages.length > limit;
+        return {
+          ok: true,
+          messages: truncated ? h.messages.slice(0, limit) : h.messages,
+          has_more: truncated || (h.has_more ?? false),
+        };
       }),
     },
     users: {

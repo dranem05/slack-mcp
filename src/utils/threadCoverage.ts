@@ -60,7 +60,12 @@ export function textPreview(text: unknown): { text?: string; truncated?: true } 
     : { text };
 }
 
-export type BotSource = "no_user" | "override" | "users.info" | "self";
+export type BotSource = "no_user" | "override" | "slack_system" | "users.info" | "self";
+
+// Slack's own system senders. users.info reports is_bot:false for both
+// (verified live 2026-09-22), yet they are never a human you owe: USLACKBOT
+// is Slackbot, USLACK posts system notices such as "archived the channel".
+export const SLACK_SYSTEM_USER_IDS: ReadonlySet<string> = new Set(["USLACKBOT", "USLACK"]);
 
 export interface BotVerdict {
   is_bot: boolean;
@@ -79,7 +84,8 @@ export interface BotResolver {
 // The bot rule, in declared order:
 //   1. no `user` on the message  → app/webhook post
 //   2. `user` in the caller's declared override list → bot
-//   3. otherwise Slack's own users.info(user).is_bot
+//   3. `user` is a Slack system sender (SLACK_SYSTEM_USER_IDS) → bot
+//   4. otherwise Slack's own users.info(user).is_bot
 // Cached per run (one resolver per tool call), one lookup per distinct user.
 // A failed lookup rejects — it is never read as "human". `username` is never
 // consulted: it is the handle for humans too.
@@ -95,6 +101,7 @@ export function createBotResolver(
     resolve(user) {
       if (!user) return Promise.resolve({ is_bot: true, source: "no_user" });
       if (override.has(user)) return Promise.resolve({ is_bot: true, source: "override" });
+      if (SLACK_SYSTEM_USER_IDS.has(user)) return Promise.resolve({ is_bot: true, source: "slack_system" });
       let pending = cache.get(user);
       if (!pending) {
         lookups++;

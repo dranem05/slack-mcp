@@ -504,12 +504,16 @@ export function registerConversationsTools(
     "slack_my_threads",
     "Threads the authenticated user posted in, and DM/group-DM conversations, classified by whose turn it is — " +
       "the replies nobody @-mentions you in, which slack_my_mentions cannot see. Verdicts use declared Slack " +
-      "fields only: owes = the NEWEST message's author (the reply whose ts === the parent's latest_reply; for DMs " +
-      "the newest in-window match) is not you → 'me', is you → 'them'; freshness = latest_reply vs the thread's own " +
+      "fields only: owes is read from the TURN message = the newest NON-bot message (bots never take the turn, so a " +
+      "bot posting after a human ask cannot hide it; turn_ts/turn_user name it, newest_* describe the absolute newest, " +
+      "whose ts === the parent's latest_reply for threads). Turn author not you → 'me', you → 'them'; a 1:1 IM whose " +
+      "other member is a bot → 'nobody'. When the newest messages are all bots the tool looks back up to 50 more; " +
+      "still no human → CANNOT-CHECK (coverage.no_human_in_window). freshness = latest_reply vs the thread's own " +
       "last_read ('unseen'/'seen'; absent last_read, which Slack omits when subscribed is false, is 'cannot_check'); " +
-      "acknowledged = your user id is in the newest message's reactions; newest_is_bot = no user, or in " +
-      "bot_user_ids, or users.info is_bot (a failed lookup is CANNOT-CHECK, never human). outcome is FINDINGS " +
-      "(some unit owes 'me', not acknowledged, not a bot), CLEAN (everything in scope evaluated, nothing owed), or " +
+      "acknowledged = your user id is in the turn message's reactions; bot = no user, or in bot_user_ids, or a " +
+      "Slack system sender (USLACKBOT, USLACK — declared constants: users.info calls them human), or users.info " +
+      "is_bot (a failed lookup is CANNOT-CHECK, never human). outcome is FINDINGS " +
+      "(some unit owes 'me' and is not acknowledged), CLEAN (everything in scope evaluated, nothing owed), or " +
       "CANNOT_CHECK (zero in-window matches — a failed search and a quiet week look alike — or any skip, cap, " +
       "unfetched page or search error). Every gap is a counted coverage field and a cannot_check[] entry. " +
       "scope 'threads' excludes DM/mpim matches (counted as dm_matches_deferred_to_dms_scope); scope 'dms' covers " +
@@ -565,7 +569,7 @@ export function registerConversationsTools(
       "never 'read'. Window is a days floor (horizon_days): roots posted before it are not examined even if their " +
       "threads moved. has_more from history → truncated: true (partial). A requested id that fails is a skipped " +
       "cannot_check entry, not an omission. Permalinks are constructed from auth.test's url, not returned by Slack. " +
-      "new_top_level_human counts only posts by someone other than you, not a bot, and not a Slack system event " +
+      "new_top_level_human counts only posts by someone other than you, not a bot (incl. USLACKBOT/USLACK), and not a Slack system event " +
       "(declared subtype such as channel_join). outcome: FINDINGS (human new posts or moved threads), CLEAN (all " +
       "resolved, nothing new, no gaps), CANNOT_CHECK.",
     {

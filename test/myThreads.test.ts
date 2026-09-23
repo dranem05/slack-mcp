@@ -302,9 +302,9 @@ describe("slack_my_threads — bots (A1c)", () => {
     },
   });
 
-  it("an unknown author Slack flags is_bot drops out of the rows", async () => {
+  it("an unknown author Slack flags is_bot never takes the turn (owes read from the newest non-bot: me)", async () => {
     const { out } = await run({ ...threadBy(botUser), users: { ...HUMANS, [botUser]: { is_bot: true, name: "claude" } } });
-    expect(out.units[0]).toMatchObject({ owes: "me", newest_is_bot: true, newest_bot_source: "users.info" });
+    expect(out.units[0]).toMatchObject({ owes: "them", turn_user: ME, newest_is_bot: true, newest_bot_source: "users.info" });
     expect(out.outcome).toBe("CLEAN");
   });
 
@@ -447,7 +447,8 @@ describe("slack_my_threads — review round 1", () => {
       { scope: "dms" }
     );
     expect(seen.out.units[0]).toMatchObject({ read_cursor: "thread", freshness: "seen", last_read: reply });
-    expect(seen.client.conversations.info).not.toHaveBeenCalled();
+    // info is still read (IM counterpart), but last_read comes from the thread parent
+    expect(seen.out.units[0].last_read).not.toBe("1790000000.000100");
 
     const unsub = await run(
       {
