@@ -11,6 +11,7 @@ All tool families work with an xoxp user token except **drafts**, which require 
 - `slack_delete_message`, `slack_get_permalink`
 - `slack_conversations_open` (start/resume DMs), `slack_conversations_mark` (mark read)
 - `slack_conversations_search_messages`, `slack_conversations_unreads`, `slack_my_mentions`
+- `slack_my_threads` (threads you posted in + DMs, classified by whose turn it is, with coverage and CANNOT-CHECK reporting), `slack_channel_digest` (what moved in a declared channel list since you last read)
 
 **Scheduled messages**
 - `slack_schedule_message` (ISO 8601 or epoch `post_at`; supports `blocks` + unfurl params), `slack_list_scheduled_messages`, `slack_delete_scheduled_message`

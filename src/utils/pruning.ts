@@ -476,3 +476,114 @@ export function pruneUploadedFile(file: UploadedFileSource): PrunedUploadedFile 
 export function pruneUploadedFiles(files: readonly UploadedFileSource[]): PrunedUploadedFile[] {
   return files.map(pruneUploadedFile);
 }
+
+// Thread read-state that conversations.replies declares on a thread parent.
+// pruneMessage drops these, which made the replies tool unable to answer
+// "has this thread moved since I read it?" without include_raw. They are
+// carried ONLY when Slack sent them: an absent last_read is itself the
+// signal (it is absent exactly when subscribed is false), so it must never
+// be defaulted. Kept separate from pruneMessage so conversations.history's
+// output — whose roots can carry the same fields — is unchanged.
+export interface ThreadStateSource extends PruneableMessage {
+  subscribed?: boolean;
+  last_read?: string;
+  latest_reply?: string;
+  reply_users_count?: number;
+}
+
+export interface PrunedThreadMessage extends PrunedMessage {
+  subscribed?: boolean;
+  last_read?: string;
+  latest_reply?: string;
+  reply_users_count?: number;
+}
+
+const THREAD_STATE_KEYS = ["subscribed", "last_read", "latest_reply", "reply_users_count"] as const;
+
+export function pruneThreadMessage(msg: ThreadStateSource): PrunedThreadMessage {
+  const pruned: PrunedThreadMessage = pruneMessage(msg);
+  for (const key of THREAD_STATE_KEYS) {
+    if (msg[key] !== undefined) {
+      (pruned as Record<string, unknown>)[key] = msg[key];
+    }
+  }
+  return pruned;
+}
+
+export function pruneThreadMessages(
+  messages: readonly ThreadStateSource[]
+): PrunedThreadMessage[] {
+  return messages.map(pruneThreadMessage);
+}
+
+// Structural subset of a search.messages match. Matches carry no thread_ts
+// FIELD and never a bot_id; the thread root lives in the permalink's
+// `thread_ts` query parameter instead (present on replies AND on roots that
+// have replies, absent on messages nobody replied to).
+export interface SearchMatchSource {
+  channel?: { id?: string; name?: string; is_im?: boolean; is_mpim?: boolean };
+  user?: string;
+  username?: string;
+  ts?: string;
+  text?: string;
+  permalink?: string;
+}
+
+export interface PrunedSearchMatch {
+  channel_id?: string;
+  channel_name?: string;
+  user?: string;
+  username?: string;
+  ts?: string;
+  permalink?: string;
+  thread_ts?: string;
+  text?: string;
+  truncated?: true;
+  is_bot?: true;
+}
+
+export const SEARCH_MATCH_TEXT_LIMIT = 200;
+
+// The root a search match belongs to, read from its permalink.
+//   string    — the permalink names a thread root (the match is a reply, or a root with replies)
+//   null      — the permalink parsed and names no thread: nobody has replied
+//   undefined — no permalink, or one that does not parse: UNKNOWN, never "no thread"
+export function permalinkThreadTs(permalink: string | undefined): string | null | undefined {
+  if (typeof permalink !== "string" || permalink.length === 0) return undefined;
+  try {
+    return new URL(permalink).searchParams.get("thread_ts");
+  } catch {
+    return undefined;
+  }
+}
+
+// Triage shape for a search match — internal to slack_my_threads (decided
+// 2026-09-22: no public tool's output changes). Far lossier than
+// pruneMessage on purpose: text is cut to 200 chars and files, reactions and
+// blocks are dropped. `is_bot` here is only the no-user / declared-override
+// part of the rule; the users.info lookup happens in the verdict path.
+export function pruneSearchMatch(
+  match: SearchMatchSource,
+  botUserIds: ReadonlySet<string> = new Set()
+): PrunedSearchMatch {
+  const pruned: PrunedSearchMatch = {
+    channel_id: match.channel?.id,
+    channel_name: match.channel?.name,
+    user: match.user,
+    username: match.username,
+    ts: match.ts,
+    permalink: match.permalink,
+  };
+  const threadTs = permalinkThreadTs(match.permalink);
+  if (typeof threadTs === "string") pruned.thread_ts = threadTs;
+  if (typeof match.text === "string") {
+    if (match.text.length > SEARCH_MATCH_TEXT_LIMIT) {
+      pruned.text = match.text.slice(0, SEARCH_MATCH_TEXT_LIMIT);
+      pruned.truncated = true;
+    } else {
+      pruned.text = match.text;
+    }
+  }
+  if (!match.user || botUserIds.has(match.user)) pruned.is_bot = true;
+  return pruned;
+}
