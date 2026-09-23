@@ -111,6 +111,8 @@ interface SearchWalk {
   matches_in_window: number;
   trimmed_out: number;
   unparsable_ts: number;
+  /** Matches seen on two pages (boundary shift mid-walk); counted once. */
+  duplicates: number;
   search_error?: string;
 }
 
@@ -130,7 +132,9 @@ async function walkSearch(
     matches_in_window: 0,
     trimmed_out: 0,
     unparsable_ts: 0,
+    duplicates: 0,
   };
+  const seenKeys = new Set<string>();
 
   let page = 1;
   while (page <= MAX_SEARCH_PAGES) {
@@ -156,10 +160,23 @@ async function walkSearch(
     }
     walk.pages_seen++;
     const pagesDeclared = res.messages?.paging?.pages;
+    if (typeof pagesDeclared !== "number" && raw.length >= SEARCH_PAGE_SIZE) {
+      // A full page with no declared page count: more may exist, unknowably.
+      walk.search_error = `page ${page}: full page with no paging.pages — cannot tell whether more pages exist`;
+    }
     walk.pages_total = typeof pagesDeclared === "number" ? pagesDeclared : Math.max(walk.pages_total, page);
     walk.matches += raw.length;
     const { kept, trimmedOut, unparsableTs } = trimToWindow(raw as SearchMatch[], floorSeconds);
-    walk.kept.push(...kept);
+    for (const m of kept) {
+      // Page boundaries shift if a message lands mid-walk; never count one twice.
+      const key = `${m.channel?.id ?? "?"}|${m.ts ?? "?"}|${m.permalink ?? ""}`;
+      if (seenKeys.has(key)) {
+        walk.duplicates++;
+        continue;
+      }
+      seenKeys.add(key);
+      walk.kept.push(m);
+    }
     walk.trimmed_out += trimmedOut;
     walk.unparsable_ts += unparsableTs;
     // sort timestamp desc: once a page trims anything the floor is crossed
@@ -168,7 +185,7 @@ async function walkSearch(
       walk.reached_floor = true;
       break;
     }
-    if (page >= walk.pages_total) break;
+    if (walk.search_error || page >= walk.pages_total) break;
     page++;
   }
   walk.matches_in_window = walk.kept.length;
@@ -189,6 +206,7 @@ function walkCoverage(walk: SearchWalk) {
     matches_in_window: walk.matches_in_window,
     trimmed_out: walk.trimmed_out,
     unparsable_ts: walk.unparsable_ts,
+    duplicates: walk.duplicates,
     ...(walk.search_error ? { search_error: walk.search_error } : {}),
   };
 }
@@ -231,7 +249,10 @@ async function verdictFor(
   me: string,
   bots: BotResolver
 ): Promise<Verdict> {
-  const bot = await bots.resolve(newest.user);
+  // My own message: owes is "them" and bot status is moot — no lookup, so a
+  // failing users.info(me) cannot turn my own turn into CANNOT-CHECK.
+  const bot: BotVerdict =
+    newest.user === me ? { is_bot: false, source: "self" } : await bots.resolve(newest.user);
   return {
     owes: newest.user === me ? "them" : "me",
     acknowledged: reactedBy(newest.reactions, me),
@@ -279,8 +300,9 @@ export interface DmUnit {
   is_im?: boolean;
   is_mpim?: boolean;
   matches_in_window: number;
+  /** Present when the unit is a thread inside the DM; absent for the conversation's main line. */
+  thread_root_ts?: string;
   newest_ts?: string;
-  newest_thread_ts?: string;
   newest_user?: string;
   newest_username?: string;
   newest_is_bot: boolean;
@@ -528,6 +550,7 @@ async function runThreads(
 
 interface DmCandidate {
   channel_id: string;
+  thread_root_ts?: string;
   channel_name?: string;
   is_im?: boolean;
   is_mpim?: boolean;
@@ -548,7 +571,12 @@ async function runDms(
   const cannot: CannotCheckEntry[] = [];
   let unroutable = 0;
 
-  const groups = new Map<string, { matches: SearchMatch[] }>();
+  // Unit = (conversation, thread root) for threaded messages and
+  // (conversation, main line) for the rest. Grouping by conversation alone
+  // let a newer main-line message hide an older unanswered thread reply.
+  let permalinkUnparsable = 0;
+  const groups = new Map<string, { channelId: string; root?: string; matches: SearchMatch[] }>();
+  const conversations = new Set<string>();
   for (const m of walk.kept) {
     const channelId = m.channel?.id;
     if (!channelId) {
@@ -556,14 +584,30 @@ async function runDms(
       cannot.push({ scope: "dms", level: "unit", reason: "match has no channel id", ts: m.ts, permalink: m.permalink });
       continue;
     }
-    const g = groups.get(channelId) ?? { matches: [] };
+    const root = permalinkThreadTs(m.permalink);
+    if (root === undefined) {
+      permalinkUnparsable++;
+      cannot.push({
+        scope: "dms",
+        level: "unit",
+        reason: "permalink absent or unparsable — thread vs main line unknown",
+        channel_id: channelId,
+        channel_name: m.channel?.name,
+        ts: m.ts,
+      });
+      continue;
+    }
+    conversations.add(channelId);
+    const key = `${channelId}|${root ?? "main"}`;
+    const g = groups.get(key) ?? { channelId, ...(root ? { root } : {}), matches: [] };
     g.matches.push(m);
-    groups.set(channelId, g);
+    groups.set(key, g);
   }
 
   const candidates: DmCandidate[] = [];
   let ambiguous = 0;
-  for (const [channelId, g] of groups) {
+  for (const { channelId, root, matches } of groups.values()) {
+    const g = { matches };
     const parsable = g.matches.filter((m) => tsNumber(m.ts) !== undefined);
     const first = g.matches[0];
     if (parsable.length !== g.matches.length) {
@@ -572,8 +616,9 @@ async function runDms(
       cannot.push({
         scope: "dms",
         level: "unit",
-        reason: "a match in this conversation has an unreadable ts — newest message unknown",
+        reason: "a match in this unit has an unreadable ts — newest message unknown",
         channel_id: channelId,
+        ...(root ? { root_ts: root } : {}),
         channel_name: first.channel?.name,
       });
       continue;
@@ -584,6 +629,7 @@ async function runDms(
       channel_name: first.channel?.name,
       is_im: first.channel?.is_im,
       is_mpim: first.channel?.is_mpim,
+      ...(root ? { thread_root_ts: root } : {}),
       newest,
       count: g.matches.length,
     });
@@ -597,12 +643,18 @@ async function runDms(
     toEvaluate,
     params.concurrency,
     async (c): Promise<EvalResult<DmUnit>> => {
-      const base = { scope: "dms" as const, channel_id: c.channel_id, channel_name: c.channel_name, ts: c.newest.ts };
+      const base = {
+        scope: "dms" as const,
+        channel_id: c.channel_id,
+        channel_name: c.channel_name,
+        ...(c.thread_root_ts ? { root_ts: c.thread_root_ts } : {}),
+        ts: c.newest.ts,
+      };
       const newestTs = c.newest.ts as string;
       // When the newest DM message is a thread reply, the conversation's
       // last_read does not cover it — the thread parent's own last_read does.
-      const threadTs = permalinkThreadTs(c.newest.permalink);
-      const inThread = typeof threadTs === "string" && threadTs !== newestTs;
+      const threadTs = c.thread_root_ts;
+      const inThread = threadTs !== undefined;
       let lastRead: string | undefined;
       let readCursor: "conversation" | "thread" = "conversation";
       let message: ThreadMessage | undefined;
@@ -653,7 +705,7 @@ async function runDms(
         ...(c.is_mpim !== undefined ? { is_mpim: c.is_mpim } : {}),
         matches_in_window: c.count,
         newest_ts: newestTs,
-        ...(typeof threadTs === "string" ? { newest_thread_ts: threadTs } : {}),
+        ...(threadTs !== undefined ? { thread_root_ts: threadTs } : {}),
         ...(message.user !== undefined ? { newest_user: message.user } : {}),
         ...(v.newest_username ? { newest_username: v.newest_username } : {}),
         newest_is_bot: v.newest_is_bot,
@@ -712,14 +764,21 @@ async function runDms(
     query,
     ...walkCoverage(walk),
     unroutable,
-    dm_conversations: groups.size,
+    permalink_unparsable: permalinkUnparsable,
+    dm_conversations: conversations.size,
     units_total: groups.size,
     units_evaluated: units.length,
     units_skipped: unitSkips,
     capped,
     freshness_cannot_check: units.filter((u) => u.freshness === "cannot_check").length,
   };
-  const blocking = !!walk.search_error || walk.pages_unfetched > 0 || unroutable > 0 || unitSkips > 0 || capped > 0;
+  const blocking =
+    !!walk.search_error ||
+    walk.pages_unfetched > 0 ||
+    unroutable > 0 ||
+    permalinkUnparsable > 0 ||
+    unitSkips > 0 ||
+    capped > 0;
   const outcome = decideOutcome(units, walk.matches_in_window, groups.size, blocking);
   return { outcome, coverage, units, cannot };
 }

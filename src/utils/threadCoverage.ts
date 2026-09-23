@@ -60,7 +60,7 @@ export function textPreview(text: unknown): { text?: string; truncated?: true } 
     : { text };
 }
 
-export type BotSource = "no_user" | "override" | "users.info";
+export type BotSource = "no_user" | "override" | "users.info" | "self";
 
 export interface BotVerdict {
   is_bot: boolean;

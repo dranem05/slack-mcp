@@ -259,6 +259,9 @@ export function registerConversationsTools(
           "query already contains a date modifier (after:/before:/on:/during:). Use either that or hours/days, not both — combining them would silently intersect two windows."
         );
       }
+      if (days !== undefined && !(Number.isFinite(days) && days > 0)) {
+        throw new ValidationError(`days must be a positive number, got ${days}`);
+      }
       const lookbackHours = hours ?? (days as number) * 24;
       const tz = await ctx.getMyTimezone();
       const window = computeSearchWindow(lookbackHours, tz.tz, Date.now, tz.source !== "slack");
@@ -528,7 +531,11 @@ export function registerConversationsTools(
         .optional()
         .default(40)
         .describe("Cap on units resolved per scope (newest first). Excess is reported as coverage.capped, never dropped silently."),
-      concurrency: z.number().optional().default(6).describe("Parallel lookups (max 10)."),
+      concurrency: z
+        .number()
+        .optional()
+        .default(6)
+        .describe("Parallel lookups per scope (max 10); scope 'both' runs the two scopes side by side."),
       bot_user_ids: z
         .string()
         .optional()

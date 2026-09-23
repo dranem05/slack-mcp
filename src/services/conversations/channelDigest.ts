@@ -15,7 +15,7 @@
 // Roots older than `days` are not examined (horizon_days, every run).
 
 import type { WebClient } from "@slack/web-api";
-import { mapWithConcurrencySettled } from "../../utils/concurrency.js";
+import { mapWithConcurrency, mapWithConcurrencySettled } from "../../utils/concurrency.js";
 import { validateChannelId, clampLimit } from "../../utils/validate.js";
 import {
   clampConcurrency,
@@ -207,7 +207,9 @@ export async function runChannelDigest(deps: ChannelDigestDeps, params: ChannelD
     // Resolve distinct authors in parallel (cached per run), then build rows.
     const authors = [...new Set(classified.map((c) => c.m.user).filter((u): u is string => !!u))];
     const verdicts = new Map<string, Awaited<ReturnType<typeof isBotOf>>>();
-    await Promise.all(authors.map(async (u) => verdicts.set(u, await isBotOf(bots, u))));
+    await mapWithConcurrency(authors, concurrency, async (u) => {
+      verdicts.set(u, await isBotOf(bots, u));
+    });
 
     const roots: DigestRoot[] = [];
     for (const { m, isNew, threadMoved, readState, movedSinceChannelRead } of classified) {

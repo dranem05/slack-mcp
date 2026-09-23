@@ -462,3 +462,97 @@ describe("slack_my_threads — review round 1", () => {
     expect(unsub.out.units[0]).toMatchObject({ read_cursor: "thread", freshness: "cannot_check" });
   });
 });
+
+describe("slack_my_threads — review round 2", () => {
+  const D1 = "D0B00000001";
+
+  it("a newer main-line DM message does not hide an older unanswered thread reply (false-negative direction)", async () => {
+    const root = "1790100000.000100";
+    const theirReply = "1790105000.000100";
+    const myLater = "1790109000.000100";
+    const { out } = await run(
+      {
+        dmPages: [[
+          match(D1, myLater, { user: ME, im: true }), // main line, newest in conversation
+          match(D1, theirReply, { user: BOB, im: true, root }),
+          match(D1, root, { user: ME, im: true, root }),
+        ]],
+        info: { [D1]: { last_read: myLater } },
+        replies: {
+          [`${D1}|${myLater}`]: [{ ts: myLater, user: ME }],
+          [`${D1}|${theirReply}`]: [{ ts: theirReply, user: BOB, thread_ts: root }],
+          [`${D1}|${root}`]: [{ ts: root, user: ME, reply_count: 1, latest_reply: theirReply, last_read: root, subscribed: true }],
+        },
+      },
+      { scope: "dms" }
+    );
+    expect(out.coverage.dms).toMatchObject({ dm_conversations: 1, units_total: 2, units_evaluated: 2 });
+    const thread = out.units.find((u) => (u as { thread_root_ts?: string }).thread_root_ts === root)!;
+    expect(thread).toMatchObject({ owes: "me", freshness: "unseen", read_cursor: "thread", newest_user: BOB });
+    const main = out.units.find((u) => !(u as { thread_root_ts?: string }).thread_root_ts)!;
+    expect(main).toMatchObject({ owes: "them", read_cursor: "conversation" });
+    expect(out.outcome).toBe("FINDINGS");
+  });
+
+  it("a DM match with an unparsable permalink is CANNOT-CHECK, not a silent fallback", async () => {
+    const t = "1790110405.408759";
+    const { out } = await run(
+      { dmPages: [[match(D1, t, { user: ALICE, im: true, permalink: "::" })]] },
+      { scope: "dms" }
+    );
+    expect(out.coverage.dms?.permalink_unparsable).toBe(1);
+    expect(out.outcome).toBe("CANNOT_CHECK");
+  });
+
+  it("my own newest message needs no users.info — a failing lookup of me cannot make my turn CANNOT-CHECK", async () => {
+    const root = "1790000000.000100";
+    const mine = "1790010000.000100";
+    const { out, client } = await run({
+      users: { ...HUMANS, [ME]: new Error("ratelimited") },
+      threadPages: [[match(MKT, mine, { root })]],
+      replies: {
+        [`${MKT}|${root}`]: [
+          { ts: root, user: BOB, reply_count: 1, latest_reply: mine, last_read: mine, subscribed: true },
+          { ts: mine, user: ME, thread_ts: root },
+        ],
+      },
+    });
+    expect(out.units[0]).toMatchObject({ owes: "them", newest_bot_source: "self" });
+    expect(client.users.info).not.toHaveBeenCalled();
+    expect(out.outcome).toBe("CLEAN");
+  });
+
+  it("a match repeated across a shifted page boundary is counted once", async () => {
+    const root = "1790000000.000100";
+    const m1 = match(MKT, "1790013000.000100", { root });
+    const m2 = match(MKT, "1790012000.000100", { root });
+    const { out } = await run({
+      threadPages: [[m1, m2], [m2]],
+      replies: {
+        [`${MKT}|${root}`]: [
+          { ts: root, user: BOB, reply_count: 1, latest_reply: "1790013000.000100", last_read: "1790013000.000100", subscribed: true },
+          { ts: "1790013000.000100", user: ME, thread_ts: root },
+        ],
+      },
+    });
+    const c = out.coverage.threads!;
+    expect(c).toMatchObject({ matches: 3, duplicates: 1, matches_in_window: 2, threaded_matches: 2 });
+    expect(c.matches).toBe(c.matches_in_window + c.trimmed_out + c.duplicates);
+  });
+
+  it("a full page with no declared page count is CANNOT-CHECK, not a one-page walk", async () => {
+    const root = "1790000000.000100";
+    const full = Array.from({ length: 100 }, (_, i) => match(MKT, `17900${String(10000 + i)}.000100`, { root }));
+    const { out } = await run({
+      search: async () => ({ ok: true, messages: { total: 100, matches: structuredClone(full) } }),
+      replies: {
+        [`${MKT}|${root}`]: [
+          { ts: root, user: BOB, reply_count: 1, latest_reply: "1790013000.000100", last_read: "1790013000.000100", subscribed: true },
+          { ts: "1790013000.000100", user: ME, thread_ts: root },
+        ],
+      },
+    });
+    expect(out.coverage.threads?.search_error).toMatch(/no paging.pages/);
+    expect(out.outcome).toBe("CANNOT_CHECK");
+  });
+});
