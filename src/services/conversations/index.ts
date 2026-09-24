@@ -399,7 +399,7 @@ export function registerConversationsTools(
       "Not covered: threads you were only mentioned in older than days, or last posted in before horizon_days.",
     {
       scope: z.enum(["threads", "dms", "mentions", "both"]).optional().default("both").describe("both = all three"),
-      days: z.number().int().min(1).max(90).optional().default(7).describe("Active window; DM and mention lookback"),
+      days: z.number().int().min(1).max(90).optional().default(7).describe("Active window; mention lookback"),
       horizon_days: z.number().int().min(1).max(90).optional().default(30).describe("Threads and DMs lookback (>= days)"),
       max_units: z.number().int().min(1).max(500).optional().default(100).describe("Per scope, newest first"),
       bot_user_ids: z.string().optional().describe("Comma-separated user ids to treat as bots"),
