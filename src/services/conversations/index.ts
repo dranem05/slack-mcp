@@ -4,8 +4,11 @@ import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
 import { withErrorHandling } from "../../utils/errors.js";
 import { validateChannelId, validateTs, clampLimit } from "../../utils/validate.js";
-import { pruneMessages } from "../../utils/pruning.js";
+import { pruneMessages, pruneReplies } from "../../utils/pruning.js";
 import { mapWithConcurrencySettled } from "../../utils/concurrency.js";
+import { searchWindow, trimToWindow } from "../../utils/searchWindow.js";
+import { ValidationError } from "../../utils/validate.js";
+import { runMyThreads } from "./myThreads.js";
 import {
   BLOCKS_DESCRIPTION,
   resolveMessageContent,
@@ -103,7 +106,7 @@ export function registerConversationsTools(
         });
         const messages = res.messages ?? [];
         return textResult({
-          messages: include_raw ? messages : pruneMessages(messages),
+          messages: include_raw ? messages : pruneReplies(messages),
           has_more: res.has_more,
           next_cursor: res.response_metadata?.next_cursor,
         });
@@ -187,7 +190,7 @@ export function registerConversationsTools(
 
   server.tool(
     "slack_conversations_search_messages",
-    "Search messages across the workspace",
+    "Search messages across the workspace; hours/days restrict it to that exact lookback, newest first.",
     {
       query: z.string().describe("Search query (supports Slack search syntax)"),
       count: z
@@ -211,10 +214,33 @@ export function registerConversationsTools(
         .describe(
           "Page number of results to return (1-indexed, default 1). search.messages paginates by page rather than cursor — use the returned 'paging' metadata to know how many pages exist."
         ),
+      hours: z.number().optional().describe("Lookback in hours (exclusive of days)"),
+      days: z.number().optional().describe("Lookback in days (exclusive of hours)"),
     },
-    withErrorHandling(ctx.slug, async ({ query, count, sort, sort_dir, page }) => {
+    withErrorHandling(ctx.slug, async ({ query, count, sort, sort_dir, page, hours, days }) => {
       // search.messages documents count as 1-100.
       const clampedCount = clampLimit(count, { max: 100, field: "count" });
+      if (hours !== undefined && days !== undefined) throw new ValidationError("pass hours or days, not both");
+      if (hours !== undefined || days !== undefined) {
+        const w = searchWindow(hours ?? days! * 24);
+        const res = await api().search.messages({
+          query: `${query} after:${w.slack_after}`,
+          count: clampedCount,
+          sort: "timestamp",
+          sort_dir: "desc",
+          page,
+        });
+        const { kept, trimmed_out } = trimToWindow(res.messages?.matches ?? [], w.floorSeconds);
+        const pages = res.messages?.paging?.pages;
+        return textResult({
+          total: res.messages?.total,
+          matches: kept,
+          paging: res.messages?.paging,
+          window: { floor_iso: w.floor_iso, slack_after: w.slack_after, trimmed_out },
+          // Newest first: a trimmed match or the last page means no later page is in-window.
+          reached_floor: trimmed_out > 0 || (typeof pages === "number" && (page ?? 1) >= pages),
+        });
+      }
       const res = await api().search.messages({
         query,
         count: clampedCount,
@@ -232,7 +258,8 @@ export function registerConversationsTools(
 
   server.tool(
     "slack_conversations_unreads",
-    "Get channels and DMs with unread messages. Channels whose info lookup fails (e.g. rate-limited) " +
+    "Get DMs with unread messages; Slack reports unread_count for 1:1 DMs only, so other conversations are listed " +
+      "under unread_count_unavailable. Channels whose info lookup fails (e.g. rate-limited) " +
       "are skipped rather than failing the whole call — the response then includes skipped_channels " +
       "and first_error.",
     {
@@ -289,32 +316,36 @@ export function registerConversationsTools(
         8,
         async (ch) => {
           const info = await api().conversations.info({ channel: ch.id });
-          const unreadCount =
-            (info.channel as Record<string, unknown> | undefined)?.unread_count as
-              | number
-              | undefined ?? 0;
+          const declared = (info.channel as Record<string, unknown> | undefined)?.unread_count;
           return {
-            id: ch.id,
-            name: ch.name || ch.id,
-            is_im: ch.is_im,
-            is_mpim: ch.is_mpim,
-            unread_count: unreadCount,
+            measured: typeof declared === "number",
+            row: {
+              id: ch.id,
+              name: ch.name || ch.id,
+              is_im: ch.is_im,
+              is_mpim: ch.is_mpim,
+              unread_count: (declared as number | undefined) ?? 0,
+            },
           };
         }
       );
+      const unavailable = results.filter((r) => !r.measured).map((r) => r.row.name);
 
       return textResult({
         unreads: results
+          .map((r) => r.row)
           .filter((u) => u.unread_count > 0)
           .sort((a, b) => b.unread_count - a.unread_count),
         ...(skipped > 0 ? { skipped_channels: skipped, first_error: firstError } : {}),
+        unread_count_unavailable: unavailable.length,
+        unread_count_unavailable_names: unavailable,
       });
     })
   );
 
   server.tool(
     "slack_my_mentions",
-    "Find recent messages that mention the authenticated user (works across channel top-level posts and thread replies, regardless of read state). Use this to catch @mentions that slack_conversations_unreads misses — that tool only returns channels with top-level unreads, so it skips thread mentions and mentions in already-read channels.",
+    "Find recent messages that mention the authenticated user (works across channel top-level posts and thread replies, regardless of read state). Use this to catch @mentions that slack_conversations_unreads misses — that tool only returns channels with top-level unreads, so it skips thread mentions and mentions in already-read channels. Matches are trimmed to exactly the last `hours` (see `window`).",
     {
       hours: z
         .number()
@@ -338,10 +369,8 @@ export function registerConversationsTools(
       const clampedCount = clampLimit(count, { max: 100, field: "count" });
       const userId = await ctx.getMyUserId();
 
-      // Slack search 'after:' takes YYYY-MM-DD. Compute the date floor from `hours` ago.
-      const floorMs = Date.now() - hours * 3600 * 1000;
-      const after = new Date(floorMs).toISOString().slice(0, 10);
-      const query = `<@${userId}> after:${after}`;
+      const w = searchWindow(hours);
+      const query = `<@${userId}> after:${w.slack_after}`;
 
       const res = await api().search.messages({
         query,
@@ -351,13 +380,34 @@ export function registerConversationsTools(
         page,
       });
 
+      const { kept, trimmed_out } = trimToWindow(res.messages?.matches ?? [], w.floorSeconds);
       return textResult({
         user_id: userId,
         query,
         total: res.messages?.total,
-        matches: res.messages?.matches,
+        matches: kept,
         paging: res.messages?.paging,
+        window: { floor_iso: w.floor_iso, slack_after: w.slack_after, trimmed_out },
       });
+    })
+  );
+
+  server.tool(
+    "slack_my_threads",
+    "Units (channel thread, DM thread, DM main line) from your posts, DMs and mentions, each with owes (me|them|nobody|cannot_check) " +
+      "read from the newest human message, your reactions on it, acknowledged (one is in clearing_reactions), unseen and active. " +
+      "Not covered: threads you were only mentioned in older than days, or last posted in before horizon_days.",
+    {
+      scope: z.enum(["threads", "dms", "mentions", "both"]).optional().default("both").describe("both = all three"),
+      days: z.number().int().min(1).max(90).optional().default(7).describe("Active window; DM and mention lookback"),
+      horizon_days: z.number().int().min(1).max(90).optional().default(30).describe("Threads-scope lookback (>= days)"),
+      max_units: z.number().int().min(1).max(500).optional().default(60).describe("Per scope, newest first"),
+      bot_user_ids: z.string().optional().describe("Comma-separated user ids to treat as bots"),
+      clearing_reactions: z.string().optional().describe("Comma-separated reaction names that acknowledge a unit"),
+    },
+    withErrorHandling(ctx.slug, async (params) => {
+      if (params.horizon_days < params.days) throw new ValidationError("horizon_days must be >= days");
+      return textResult(await runMyThreads(api(), await ctx.getMyUserId(), params));
     })
   );
 

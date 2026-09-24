@@ -61,6 +61,21 @@ export function pruneMessages(messages: readonly PruneableMessage[]): PrunedMess
   return messages.map(pruneMessage);
 }
 
+// conversations.replies only: also keep the thread read state when Slack
+// sends it (never defaulted). history keeps pruneMessages unchanged.
+const THREAD_STATE_KEYS = ["subscribed", "last_read", "latest_reply", "reply_users_count"] as const;
+
+export function pruneReplies(messages: readonly PruneableMessage[]): Array<PrunedMessage & Record<string, unknown>> {
+  return messages.map((m) => {
+    const out: PrunedMessage & Record<string, unknown> = { ...pruneMessage(m) };
+    for (const k of THREAD_STATE_KEYS) {
+      const v = (m as Record<string, unknown>)[k];
+      if (v !== undefined) out[k] = v;
+    }
+    return out;
+  });
+}
+
 export interface PrunedDraft {
   id?: unknown;
   last_updated_ts?: unknown;
