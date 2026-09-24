@@ -238,17 +238,17 @@ describe("mergeUserInfo", () => {
       is_admin: true,
       tz: "America/Los_Angeles",
       profile: {
-        display_name: "david (info)",
+        display_name: "erin (info)",
         title: "Engineer (info)",
-        email: "david@example.com",
+        email: "erin@example.com",
         status_text: "in a meeting",
         status_emoji: ":calendar:",
       },
     };
     const profile = {
-      display_name: "david",
+      display_name: "erin",
       title: "Staff Engineer",
-      email: "david@example.com",
+      email: "erin@example.com",
       status_text: "in a meeting",
       status_emoji: ":calendar:",
     };
@@ -257,9 +257,9 @@ describe("mergeUserInfo", () => {
       id: "U123",
       name: "dchang",
       real_name: "David Chang",
-      display_name: "david",
+      display_name: "erin",
       title: "Staff Engineer",
-      email: "david@example.com",
+      email: "erin@example.com",
       tz: "America/Los_Angeles",
       status_text: "in a meeting",
       status_emoji: ":calendar:",
