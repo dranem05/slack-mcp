@@ -102,6 +102,12 @@ describe("owes / turn", () => {
     expect(full.newest.ts).toBe(R);
   });
 
+  it("CANNOT-CHECK when the fetched replies do not include the declared latest_reply", async () => {
+    const { out } = await run(threadScope([msg(ago(40), ME), msg(ago(10), ANA)], { latest_reply: ago(1) }));
+    expect(out.units).toHaveLength(0);
+    expect(out.cannot_check[0].reason).toBe("fetched replies do not include the declared latest_reply");
+  });
+
   it("replies is called with limit 3 on the root", async () => {
     const { client } = await run(threadScope([msg(ago(10), ANA)]));
     expect(client.conversations.replies).toHaveBeenCalledWith({ channel: CH, ts: R, limit: 3 });
@@ -211,6 +217,21 @@ describe("threads scope enumeration", () => {
     );
     expect(out.units).toHaveLength(1);
     expect(out.coverage.threads.capped).toBe(1);
+  });
+
+  it("a thread capped out of the threads scope is still evaluated from a mention", async () => {
+    const R2 = ago(60);
+    const { out } = await run(
+      {
+        threads: [[match(CH, ago(10), R), match(CH, ago(11), R2)]],
+        dms: [[]],
+        mentions: [[match(CH, ago(11), R2)]],
+        replies: { [`${CH}|${R}`]: thread([msg(ago(10), ANA)]), [`${CH}|${R2}`]: [root(R2, ANA, 1), msg(ago(11), ANA)] },
+      },
+      { scope: "both", max_units: 1 }
+    );
+    expect(out.coverage.threads.capped).toBe(1);
+    expect(out.units.map((u) => [u.kind, u.root_ts])).toEqual([["thread", R], ["mention", R2]]);
   });
 
   it("walks every page until the floor, and a failed search is CANNOT-CHECK", async () => {
@@ -333,5 +354,14 @@ describe("mentions scope", () => {
   it("mentions use the days window, not the threads horizon", async () => {
     const { out } = await run({ mentions: [[match(CH, ago(24 * 10), R)]] }, { scope: "mentions" });
     expect(out.coverage.mentions).toMatchObject({ matches: 0, window: { trimmed_out: 1 } });
+  });
+});
+
+describe("tool registration", () => {
+  it("horizon_days >= days is only enforced when the threads scope runs", async () => {
+    const { connectConversationsTools } = await import("./helpers/toolHarness.js");
+    const h = await connectConversationsTools(fakeSlack({ users: USERS }), ME);
+    expect(await h.call("slack_my_threads", { scope: "dms", days: 45 })).not.toContain("horizon_days must");
+    expect(await h.call("slack_my_threads", { scope: "both", days: 45 })).toContain("horizon_days must be >= days");
   });
 });

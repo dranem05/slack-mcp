@@ -12,8 +12,8 @@ export interface SearchWindow {
 }
 
 export function searchWindow(hours: number, nowMs = Date.now()): SearchWindow {
-  if (!Number.isFinite(hours) || hours <= 0 || hours > 24 * 3650) {
-    throw new ValidationError(`lookback must be between 0 and 3650 days, got ${hours} hours`);
+  if (!Number.isFinite(hours) || hours < 0 || hours > 24 * 3650) {
+    throw new ValidationError(`lookback must be 0 to 3650 days, got ${hours} hours`);
   }
   const floorMs = nowMs - hours * 3600_000;
   return {

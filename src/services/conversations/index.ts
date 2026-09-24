@@ -406,7 +406,8 @@ export function registerConversationsTools(
       clearing_reactions: z.string().optional().describe("Comma-separated reaction names that acknowledge a unit"),
     },
     withErrorHandling(ctx.slug, async (params) => {
-      if (params.horizon_days < params.days) throw new ValidationError("horizon_days must be >= days");
+      const threads = params.scope === "threads" || params.scope === "both";
+      if (threads && params.horizon_days < params.days) throw new ValidationError("horizon_days must be >= days");
       return textResult(await runMyThreads(api(), await ctx.getMyUserId(), params));
     })
   );

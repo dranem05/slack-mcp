@@ -27,8 +27,9 @@ describe("searchWindow", () => {
     expect(trimmed_out).toBe(1);
   });
 
-  it("rejects a non-positive lookback", () => {
-    expect(() => searchWindow(0)).toThrow();
+  it("rejects a negative lookback; hours 0 (as origin/main accepted) is an empty window", () => {
+    expect(() => searchWindow(-1)).toThrow();
+    expect(searchWindow(0, 1_000_000).floorSeconds).toBe(1000);
   });
 });
 

@@ -86,6 +86,7 @@ export async function runMyThreads(client: Client, me: string, p: MyThreadsParam
     coverage[scope] = cov;
     if (kept.length === 0) cannot.push({ scope, reason: "zero search matches in window" });
     if (page_capped) cannot.push({ scope, reason: `search stopped at ${MAX_PAGES} pages; older matches not fetched` });
+    const capped = new Set<string>();
     for (const m of kept) {
       const ch = m.channel;
       let root: string | null | undefined;
@@ -109,6 +110,8 @@ export async function runMyThreads(client: Client, me: string, p: MyThreadsParam
         if (units.get(key)!.scope !== scope) cov.skipped++; // already a unit from another scope
         continue;
       }
+      // Cap per scope, newest first; a capped key stays open for later scopes.
+      if (perScope[scope].length >= p.max_units) { capped.add(key); continue; }
       const c: Candidate = {
         scope, channel_id: ch.id, channel_name: ch.name, root_ts: rootTs, declared: root !== null, ts: m.ts,
         im_user: ch.is_im === true ? ch.user : undefined, origin: new URL(m.permalink!).origin,
@@ -116,15 +119,9 @@ export async function runMyThreads(client: Client, me: string, p: MyThreadsParam
       units.set(key, c);
       perScope[scope].push(c);
     }
+    cov.capped = capped.size;
   });
-
-  // Per-scope cap, newest first (matches arrive newest first).
-  const todo: Candidate[] = [];
-  for (const s of scopes) {
-    const kept = perScope[s].slice(0, p.max_units);
-    coverage[s].capped = perScope[s].length - kept.length;
-    todo.push(...kept);
-  }
+  const todo = scopes.flatMap((s) => perScope[s]);
 
   const botCache = new Map<string, Promise<{ is_bot: boolean; name?: string }>>();
   const lookup = (user: string) => {
@@ -140,6 +137,13 @@ export async function runMyThreads(client: Client, me: string, p: MyThreadsParam
   const isBot = async (user: string | undefined) =>
     user === me ? false : !user || SYSTEM_USERS.has(user) || overrides.has(user) ? true : (await lookup(user)).is_bot;
   const activeFloor = nowMs / 1000 - p.days * 86400;
+  const infoCache = new Map<string, Promise<string | undefined>>();
+  const lastReadOf = (channel: string) => {
+    if (!infoCache.has(channel)) {
+      infoCache.set(channel, client.conversations.info({ channel }).then((r) => (r.channel as Msg | undefined)?.last_read));
+    }
+    return infoCache.get(channel)!;
+  };
 
   const evaluate = async (c: Candidate) => {
     const target = c.root_ts ?? c.ts;
@@ -151,10 +155,13 @@ export async function runMyThreads(client: Client, me: string, p: MyThreadsParam
     if (!parent) throw new Error("conversations.replies did not return the target message");
     const thread = c.root_ts !== undefined && typeof parent.reply_count === "number";
     if (c.declared && !thread) throw new Error("reply_count absent on a declared thread root");
+    if (thread && parent.latest_reply && !msgs.some((m) => m.ts === parent.latest_reply)) {
+      throw new Error("fetched replies do not include the declared latest_reply");
+    }
     const replies = thread ? msgs.filter((m) => m !== parent) : [];
     // The parent may be the turn only when every reply was returned.
     const candidates = !thread ? [parent] : replies.length >= parent.reply_count! ? msgs : replies;
-    const lastRead = thread ? parent.last_read : ((await client.conversations.info({ channel: c.channel_id })).channel as Msg | undefined)?.last_read;
+    const lastRead = thread ? parent.last_read : await lastReadOf(c.channel_id);
     const latest = thread ? parent.latest_reply : parent.ts;
 
     const sorted = [...candidates].sort((a, b) => num(b.ts) - num(a.ts));
