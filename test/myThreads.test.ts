@@ -29,7 +29,7 @@ function thread(replies: Msg[], rootExtra: Msg = {}): Msg[] {
 
 async function run(o: FakeSlackOptions, p: Partial<MyThreadsParams> = {}) {
   const client = fakeSlack({ users: USERS, ...o });
-  const out = await runMyThreads(client as never, ME, { scope: "threads", days: 7, horizon_days: 30, max_units: 60, clearing_reactions: CLEAR, ...p }, NOW);
+  const out = await runMyThreads(client as never, ME, { scope: "threads", days: 7, horizon_days: 30, max_units: 100, clearing_reactions: CLEAR, ...p }, NOW);
   return { out, client };
 }
 const one = async (o: FakeSlackOptions, p: Partial<MyThreadsParams> = {}) => {
@@ -217,6 +217,9 @@ describe("threads scope enumeration", () => {
     );
     expect(out.units).toHaveLength(1);
     expect(out.coverage.threads.capped).toBe(1);
+    expect(out.cannot_check).toEqual([{ scope: "threads", reason: "max_units 1 reached; 1 older units not evaluated" }]);
+    // false-negative direction: under the cap nothing is listed
+    expect((await run({ threads: [[match(CH, ago(10), R)]], replies: { [`${CH}|${R}`]: thread([msg(ago(10), ANA)]) } }, { max_units: 1 })).out.cannot_check).toEqual([]);
   });
 
   it("a thread capped out of the threads scope is still evaluated from a mention", async () => {
@@ -306,6 +309,27 @@ describe("dms scope", () => {
     expect((await one({ ...human, dms: [[match(DM, t1, undefined, im)]] }, { scope: "dms" })).owes).toBe("me");
   });
 
+  it("DM thread and mpim main line 8-30 days old are returned inactive, owed; trimmed at horizon 7", async () => {
+    const MP = "C0000000MP1";
+    const OLD = ago(24 * 20);
+    const t2 = ago(24 * 12);
+    const o = {
+      dms: [[match(MP, t2, undefined, { is_mpim: true, name: "mpdm-x" }), match(DM, ago(24 * 15), OLD, im)]],
+      replies: {
+        [`${MP}|${t2}`]: [msg(t2, BEN, { reactions: [{ name: "thankyou", users: [ME] }] })],
+        [`${DM}|${OLD}`]: [root(OLD, ME, 1), msg(ago(24 * 15), ANA, { reactions: [{ name: "thumbsup_all", users: [ME] }] })],
+      },
+      info: { [MP]: { id: MP, last_read: t2 } },
+    };
+    const { out } = await run(o, { scope: "dms" });
+    expect(out.units.map((u) => [u.channel_id, u.owes, u.acknowledged, u.active, u.my_reactions])).toEqual([
+      [MP, "me", false, false, ["thankyou"]],
+      [DM, "me", false, false, ["thumbsup_all"]],
+    ]);
+    // false-negative direction: the old days-only window loses both
+    expect((await run(o, { scope: "dms", horizon_days: 7 })).out.units).toHaveLength(0);
+  });
+
   it("main-line last_read absent → unseen null; info failure → CANNOT-CHECK", async () => {
     const t1 = ago(10);
     const o = { dms: [[match(DM, t1, undefined, im)]], replies: { [`${DM}|${t1}`]: [msg(t1, ANA)] } };
@@ -361,7 +385,8 @@ describe("tool registration", () => {
   it("horizon_days >= days is only enforced when the threads scope runs", async () => {
     const { connectConversationsTools } = await import("./helpers/toolHarness.js");
     const h = await connectConversationsTools(fakeSlack({ users: USERS }), ME);
-    expect(await h.call("slack_my_threads", { scope: "dms", days: 45 })).not.toContain("horizon_days must");
+    expect(await h.call("slack_my_threads", { scope: "mentions", days: 45 })).not.toContain("horizon_days must");
+    expect(await h.call("slack_my_threads", { scope: "dms", days: 45 })).toContain("horizon_days must be >= days");
     expect(await h.call("slack_my_threads", { scope: "both", days: 45 })).toContain("horizon_days must be >= days");
   });
 });

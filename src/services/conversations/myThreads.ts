@@ -62,7 +62,7 @@ export async function runMyThreads(client: Client, me: string, p: MyThreadsParam
   const awaiting = new Set<string>();
   const query: Record<Scope, [string, number]> = {
     threads: [`from:<@${me}>`, p.horizon_days],
-    dms: ["is:dm", p.days],
+    dms: ["is:dm", p.horizon_days], // same horizon + active rule as threads
     mentions: [`<@${me}>`, p.days],
   };
 
@@ -120,6 +120,7 @@ export async function runMyThreads(client: Client, me: string, p: MyThreadsParam
       perScope[scope].push(c);
     }
     cov.capped = capped.size;
+    if (capped.size > 0) cannot.push({ scope, reason: `max_units ${p.max_units} reached; ${capped.size} older units not evaluated` });
   });
   const todo = scopes.flatMap((s) => perScope[s]);
 

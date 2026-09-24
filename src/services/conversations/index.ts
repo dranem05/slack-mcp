@@ -400,14 +400,13 @@ export function registerConversationsTools(
     {
       scope: z.enum(["threads", "dms", "mentions", "both"]).optional().default("both").describe("both = all three"),
       days: z.number().int().min(1).max(90).optional().default(7).describe("Active window; DM and mention lookback"),
-      horizon_days: z.number().int().min(1).max(90).optional().default(30).describe("Threads-scope lookback (>= days)"),
-      max_units: z.number().int().min(1).max(500).optional().default(60).describe("Per scope, newest first"),
+      horizon_days: z.number().int().min(1).max(90).optional().default(30).describe("Threads and DMs lookback (>= days)"),
+      max_units: z.number().int().min(1).max(500).optional().default(100).describe("Per scope, newest first"),
       bot_user_ids: z.string().optional().describe("Comma-separated user ids to treat as bots"),
       clearing_reactions: z.string().optional().describe("Comma-separated reaction names that acknowledge a unit"),
     },
     withErrorHandling(ctx.slug, async (params) => {
-      const threads = params.scope === "threads" || params.scope === "both";
-      if (threads && params.horizon_days < params.days) throw new ValidationError("horizon_days must be >= days");
+      if (params.scope !== "mentions" && params.horizon_days < params.days) throw new ValidationError("horizon_days must be >= days");
       return textResult(await runMyThreads(api(), await ctx.getMyUserId(), params));
     })
   );
