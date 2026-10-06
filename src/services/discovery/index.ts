@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
-import { withErrorHandling } from "../../utils/errors.js";
+import { withErrorHandling, isMissingScopeError } from "../../utils/errors.js";
 import { validateChannelId, validateUserId, validateTs } from "../../utils/validate.js";
 import { memoizeWithTtl } from "../../utils/ttlCache.js";
 import { pruneEmojiList, mergeUserInfo } from "../../utils/pruning.js";
@@ -41,11 +41,21 @@ export function registerDiscoveryTools(
     },
     withErrorHandling(ctx.slug, async ({ user_id }) => {
       validateUserId(user_id);
+      // users.profile.get needs users.profile:read, a scope some tokens
+      // don't have — treat that one error as "no extra profile data" rather
+      // than failing the whole tool, since mergeUserInfo already falls back
+      // to users.info's nested profile in that case. Any other profile.get
+      // error (or a users.info failure) still propagates.
       const [infoRes, profileRes] = await Promise.all([
         api().users.info({ user: user_id }),
-        api().users.profile.get({ user: user_id }),
+        api()
+          .users.profile.get({ user: user_id })
+          .catch((err) => {
+            if (isMissingScopeError(err)) return undefined;
+            throw err;
+          }),
       ]);
-      return textResult(mergeUserInfo(infoRes.user, profileRes.profile));
+      return textResult(mergeUserInfo(infoRes.user, profileRes?.profile));
     })
   );
 

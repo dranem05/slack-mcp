@@ -36,6 +36,13 @@ function isWebApiErrorShape(err: unknown): err is WebApiErrorShape {
   return typeof err === "object" && err !== null && "data" in err;
 }
 
+// Lets a caller treat one specific Slack error code as non-fatal (e.g. a
+// profile lookup whose only use of the extra scope is a nice-to-have) while
+// still letting every other error propagate normally.
+export function isMissingScopeError(err: unknown): boolean {
+  return isWebApiErrorShape(err) && err.data?.error === "missing_scope";
+}
+
 export function mapSlackError(err: unknown, slug: string): MappedSlackError {
   if (err instanceof BrowserApiError) {
     const result: MappedSlackError = { error: err.slackError };
