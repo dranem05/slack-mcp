@@ -59,7 +59,7 @@ Tools are gated by what tokens are available in env vars for the slug you pass w
 
 If `SLACK_XOXC_<SLUG>` or `SLACK_XOXD_<SLUG>` is missing, the draft tools register but throw a clear error at call time. Everything else still works on xoxp alone.
 
-Some families depend on the xoxp token's granted scopes (e.g. reminders, pins, bookmarks, canvases, files). A missing scope surfaces as a structured `missing_scope` error naming the needed scope rather than a silent failure. Reminders are additionally a user-token-only API — no bot token works for them.
+Some families depend on the xoxp token's granted scopes (e.g. reminders, pins, bookmarks, canvases, files). A missing scope surfaces as a structured `missing_scope` error naming the needed scope rather than a silent failure. One exception: `slack_user_info` works without `users.profile:read`, falling back to the profile `users.info` returns (same fields). Reminders are additionally a user-token-only API — no bot token works for them.
 
 ## Extracting xoxc + xoxd from your browser
 

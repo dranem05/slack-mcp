@@ -9,7 +9,7 @@ function webApiError(data: Record<string, unknown>): Error {
 
 // registerDiscoveryTools only calls server.tool(name, description, schema,
 // handler) — capture those calls instead of spinning up a real McpServer /
-// transport, same narrow-seam approach as the other service tests.
+// transport, so the real handler runs against a stubbed client.
 function fakeServer() {
   const handlers = new Map<string, (params: unknown) => Promise<unknown>>();
   return {
@@ -69,6 +69,8 @@ describe("slack_user_info", () => {
       display_name: "jane (info)",
       title: "Engineer (info)",
     });
+    expect(client.users.info).toHaveBeenCalledWith({ user: "U0123456789" });
+    expect(client.users.profile.get).toHaveBeenCalledWith({ user: "U0123456789" });
   });
 
   it("still surfaces an error when users.info itself fails", async () => {
@@ -85,9 +87,7 @@ describe("slack_user_info", () => {
     };
     registerDiscoveryTools(server as never, fakeCtx(client) as never);
 
-    const handler = server.handlers.get("slack_user_info")!;
-    const result = (await handler({ user_id: "U0123456789" })) as { content: Array<{ text: string }> };
-    const parsed = JSON.parse(result.content[0].text);
+    const parsed = await callUserInfo(server);
 
     expect(parsed.ok).toBe(false);
     expect(parsed.error).toBe("user_not_found");
@@ -128,18 +128,16 @@ describe("slack_user_info", () => {
         info: vi.fn(async () => ({ ok: true, user: { id: "U0123456789", name: "jdoe" } })),
         profile: {
           get: vi.fn(async () => {
-            throw webApiError({ error: "ratelimited" });
+            throw webApiError({ error: "user_not_found" });
           }),
         },
       },
     };
     registerDiscoveryTools(server as never, fakeCtx(client) as never);
 
-    const handler = server.handlers.get("slack_user_info")!;
-    const result = (await handler({ user_id: "U0123456789" })) as { content: Array<{ text: string }> };
-    const parsed = JSON.parse(result.content[0].text);
+    const parsed = await callUserInfo(server);
 
     expect(parsed.ok).toBe(false);
-    expect(parsed.error).toBe("ratelimited");
+    expect(parsed.error).toBe("user_not_found");
   });
 });
